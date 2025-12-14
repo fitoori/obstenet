@@ -277,7 +277,7 @@ class MotionGovernor:
         if not self._enabled or not self._monitor.available():
             return dp, dt, "bypass", None, 1.0
         v = self._monitor.voltage()
-        uv = self._monitor.undervoltage_now() or self._monitor.undervoltage_seen()
+        uv = self._monitor.undervoltage_now()
         action = "normal"
         factor = 1.0
         if uv or (v is not None and v <= POWER_CUTOFF_VOLTS):
