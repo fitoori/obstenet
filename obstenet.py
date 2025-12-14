@@ -255,11 +255,6 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
         except Exception:
             pass
         return False
-        try:
-            pantilthat.servo_enable(1, on)
-            pantilthat.servo_enable(2, on)
-        except Exception:
-            pass
 
     def _apply(fn, val: int) -> None:
         last_exc: Optional[Exception] = None
@@ -343,7 +338,7 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
         except Exception:
             pass
 
-        _ka_fail = 0
+    _ka_fail = 0
     while not stop_evt.is_set():
         now = time.monotonic()
         if now - last_hb >= HEARTBEAT_PERIOD_S:
