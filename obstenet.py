@@ -82,12 +82,25 @@ CAM_RESTARTS_MAX_PER_HOUR: int = 120
 # --- Resilience: request shaping ---
 MOVE_MIN_INTERVAL_S: float = 0.02
 
+import os
+from typing import Optional
+
+# --- Home Assistant integration / discovery ---
+HA_DISCOVERY_ENABLE: bool = os.environ.get("HA_DISCOVERY", "0").lower() in ("1", "true", "yes", "on")
+HA_MQTT_BROKER: Optional[str] = os.environ.get("HA_MQTT_BROKER")
+HA_MQTT_PORT: int = int(os.environ.get("HA_MQTT_PORT", "1883"))
+HA_MQTT_USERNAME: Optional[str] = os.environ.get("HA_MQTT_USERNAME")
+HA_MQTT_PASSWORD: Optional[str] = os.environ.get("HA_MQTT_PASSWORD")
+HA_MQTT_BASE_TOPIC: str = os.environ.get("HA_MQTT_BASE_TOPIC", "homeassistant")
+HA_BASE_URL: Optional[str] = os.environ.get("HA_BASE_URL")
+HA_CAMERA_NAME: str = os.environ.get("HA_CAMERA_NAME", "Obstenet Camera")
+HA_CAMERA_ID: str = os.environ.get("HA_CAMERA_ID", "obstenet_cam")
+
 import atexit
 import glob
 import io
 import json
 import logging
-import os
 import resource
 import shutil
 import signal
@@ -100,10 +113,11 @@ import uuid
 import subprocess
 from collections import deque, defaultdict
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple, List
+from typing import Dict, Tuple, List
 
 import faulthandler
 from flask import Flask, Response, abort, jsonify, request, make_response
+from urllib.parse import urlsplit
 
 # Hardware libs (fail-fast with guidance)
 try:
@@ -213,6 +227,8 @@ class VoltageMonitor:
             # (~1V) which would falsely trigger the motion governor.
             cmd = ["vcgencmd", "measure_volts", "supply"]
             r = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=1.0)
+        try:
+            r = subprocess.run(["vcgencmd", "measure_volts"], check=False, capture_output=True, text=True, timeout=1.0)
             if r.returncode != 0:
                 return None
             out = r.stdout.strip()
@@ -222,6 +238,7 @@ class VoltageMonitor:
             fval = float(val)
             # Reject implausible rails (e.g., core) so we fall back to throttled flags only.
             return fval if fval >= 3.0 else None
+            return float(val)
         except Exception:
             return None
 
@@ -282,6 +299,9 @@ class MotionGovernor:
     def apply(self, dp: float, dt: float) -> Tuple[float, float, str, Optional[float]]:
         if not self._enabled or not self._monitor.available():
             return dp, dt, "bypass", None
+    def apply(self, dp: float, dt: float) -> Tuple[float, float, str, Optional[float], float]:
+        if not self._enabled or not self._monitor.available():
+            return dp, dt, "bypass", None, 1.0
         v = self._monitor.voltage()
         uv = self._monitor.undervoltage_now() or self._monitor.undervoltage_seen()
         action = "normal"
@@ -298,6 +318,7 @@ class MotionGovernor:
 
         self._log_transition(action, v, dp, dt, factor)
         return dp, dt, action, v
+        return dp, dt, action, v, factor
 
     def _log_transition(self, action: str, v: Optional[float], dp: float, dt: float, factor: float) -> None:
         state_key = f"{action}-{int(round((v or 0.0)*100))}"
@@ -413,11 +434,6 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
         except Exception:
             pass
         return False
-        try:
-            pantilthat.servo_enable(1, on)
-            pantilthat.servo_enable(2, on)
-        except Exception:
-            pass
 
     def _apply(fn, val: int) -> None:
         last_exc: Optional[Exception] = None
@@ -501,7 +517,7 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
         except Exception:
             pass
 
-        _ka_fail = 0
+    _ka_fail = 0
     while not stop_evt.is_set():
         now = time.monotonic()
         if now - last_hb >= HEARTBEAT_PERIOD_S:
@@ -1029,6 +1045,9 @@ _INDEX = f"""<!doctype html>
   header .toolbar button, header .toolbar input[type=number] {{
     font-size:1rem; padding:.35rem .6rem; border-radius:8px; border:1px solid #333; background:#222; color:#eee;
   }}
+  .status {{ font-size:0.95rem; color:#bbb; }}
+  .status.warn {{ color:#ffb347; }}
+  .status.cutoff {{ color:#ff6b6b; font-weight:700; }}
   main {{ display:flex; flex-direction:column; align-items:center; gap:.6rem; padding:.6rem; }}
   img {{ max-width:100%; height:auto; border:1px solid #333; border-radius:6px; }}
   .hidden {{ display:none !important; }}
@@ -1071,6 +1090,7 @@ _INDEX = f"""<!doctype html>
     <button id="release" title="Power off servos (freewheel)">Release</button>
     <button id="led" class="hidden" aria-pressed="false" title="Toggle camera LED">LED: Off</button>
   </div>
+  <div id="power-status" class="status" role="status" aria-live="polite">Power: --</div>
 </header>
 <main>
   <img id="stream" src="/stream.mjpg" alt="camera stream" referrerpolicy="no-referrer" loading="eager" decoding="async">
@@ -1097,6 +1117,21 @@ _INDEX = f"""<!doctype html>
     const t = await r.text();
     if (!r.ok) throw new Error(t||r.statusText);
     try {{ return t ? JSON.parse(t) : {{}}; }} catch(_) {{ return {{}}; }}
+  }}
+  const powerStatus = document.getElementById('power-status');
+  function renderPowerStatus(resp) {{
+    if (!powerStatus || !resp || typeof resp !== 'object') return resp;
+    const action = resp.power_action || 'bypass';
+    const v = typeof resp.voltage_v === 'number' ? resp.voltage_v : null;
+    const factor = typeof resp.power_factor === 'number' ? resp.power_factor : null;
+    let text = 'Power: ' + action;
+    powerStatus.classList.remove('warn','cutoff');
+    if (factor !== null && factor < 0.999) text += ' (' + Math.round(factor*100) + '%)';
+    if (v !== null) text += ' @ ' + v.toFixed(2) + 'V';
+    if (action === 'scale') powerStatus.classList.add('warn');
+    if (action === 'inhibit') powerStatus.classList.add('cutoff');
+    powerStatus.textContent = text;
+    return resp;
   }}
   // LED capability discovery
   (async () => {{
@@ -1125,20 +1160,20 @@ _INDEX = f"""<!doctype html>
 
   // D-pad actions
   const step = () => getStep();
-  document.getElementById('up').onclick    = () => postJSON('/api/move', {{dp:0, dt:-step()}}).catch(()=>{{}});
-  document.getElementById('down').onclick  = () => postJSON('/api/move', {{dp:0, dt: step()}}).catch(()=>{{}});
-  document.getElementById('left').onclick  = () => postJSON('/api/move', {{dp:-step(), dt:0}}).catch(()=>{{}});
-  document.getElementById('right').onclick = () => postJSON('/api/move', {{dp: step(), dt:0}}).catch(()=>{{}});
+  document.getElementById('up').onclick    = () => postJSON('/api/move', {{dp:0, dt:-step()}}).then(renderPowerStatus).catch(()=>{{}});
+  document.getElementById('down').onclick  = () => postJSON('/api/move', {{dp:0, dt: step()}}).then(renderPowerStatus).catch(()=>{{}});
+  document.getElementById('left').onclick  = () => postJSON('/api/move', {{dp:-step(), dt:0}}).then(renderPowerStatus).catch(()=>{{}});
+  document.getElementById('right').onclick = () => postJSON('/api/move', {{dp: step(), dt:0}}).then(renderPowerStatus).catch(()=>{{}});
   document.getElementById('home').onclick  = () => postJSON('/api/home', {{}}).catch(()=>{{}});
 
   // Keyboard shortcuts (desktop-only to avoid stealing focus in embeds)
   if (!window.matchMedia('(pointer: coarse)').matches && qs.get('embed') !== '1') {{
     window.addEventListener('keydown', (ev) => {{
       const s = step(), k = ev.key.toLowerCase();
-      if (k==='arrowup')    postJSON('/api/move', {{dp:0, dt:-s}}).catch(()=>{{}});
-      if (k==='arrowdown')  postJSON('/api/move', {{dp:0, dt: s}}).catch(()=>{{}});
-      if (k==='arrowleft')  postJSON('/api/move', {{dp:-s, dt:0}}).catch(()=>{{}});
-      if (k==='arrowright') postJSON('/api/move', {{dp: s, dt:0}}).catch(()=>{{}});
+        if (k==='arrowup')    postJSON('/api/move', {{dp:0, dt:-s}}).then(renderPowerStatus).catch(()=>{{}});
+        if (k==='arrowdown')  postJSON('/api/move', {{dp:0, dt: s}}).then(renderPowerStatus).catch(()=>{{}});
+        if (k==='arrowleft')  postJSON('/api/move', {{dp:-s, dt:0}}).then(renderPowerStatus).catch(()=>{{}});
+        if (k==='arrowright') postJSON('/api/move', {{dp: s, dt:0}}).then(renderPowerStatus).catch(()=>{{}});
       if (k==='c') postJSON('/api/home', {{}}).catch(()=>{{}});
       if (k==='r') postJSON('/api/servo/release', {{}}).catch(()=>{{}});
       if (k==='s') window.open('/snapshot.jpg?ts=' + Date.now(),'_blank','noopener,noreferrer');
@@ -1204,6 +1239,96 @@ def _pick_host() -> str:
         return HOST
     return HOST
 
+
+def _guess_base_url() -> str:
+    """Best effort HTTP base URL for discovery (mDNS/MQTT)."""
+    if HA_BASE_URL:
+        return HA_BASE_URL.rstrip("/")
+
+    candidates: list[str] = []
+    for iface in ("tailscale0", "wlan0", "eth0", "en0"):
+        ip = _iface_ipv4(iface)
+        if ip:
+            candidates.append(ip)
+    try:
+        hostname_ip = socket.gethostbyname(socket.gethostname())
+        if hostname_ip:
+            candidates.append(hostname_ip)
+    except Exception:
+        pass
+    host = next((c for c in candidates if c and not c.startswith("127.")), "127.0.0.1")
+    return f"http://{host}:{PORT}"
+
+
+def _ha_device_info() -> Dict[str, object]:
+    return {
+        "identifiers": ["obstenet", HA_CAMERA_ID],
+        "manufacturer": "Obstenet",
+        "model": "PanTilt Camera",
+        "name": HA_CAMERA_NAME,
+    }
+
+
+def _ha_camera_payload(base_url: str) -> Dict[str, object]:
+    urls = {
+        "mjpeg_url": f"{base_url}/stream.mjpg",
+        "still_image_url": f"{base_url}/snapshot.jpg",
+        "stream_source": f"{base_url}/stream.mjpg",
+        "control_api": f"{base_url}/api",
+    }
+    return {
+        "name": HA_CAMERA_NAME,
+        "unique_id": HA_CAMERA_ID,
+        "device": _ha_device_info(),
+        "availability_topic": f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/status",
+        "payload_available": "online",
+        "payload_not_available": "offline",
+        "json_attributes_topic": f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/attributes",
+        # Home Assistant Generic camera uses these URLs; stream_source helps the stream component.
+        **urls,
+    }
+
+
+_ha_base_url: str = _guess_base_url()
+
+
+def _publish_home_assistant_mqtt(base_url: str) -> None:
+    if not HA_DISCOVERY_ENABLE:
+        return
+    if not HA_MQTT_BROKER:
+        log.info("HA discovery requested but HA_MQTT_BROKER not set; skipping MQTT publish.")
+        return
+    try:
+        import paho.mqtt.client as mqtt
+    except Exception as e:
+        log.warning("HA discovery enabled but paho-mqtt is missing: %s", e)
+        return
+
+    config_topic = f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/config"
+    status_topic = f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/status"
+    attr_topic = f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/attributes"
+    payload = _ha_camera_payload(base_url)
+
+    client = mqtt.Client(client_id=f"{HA_CAMERA_ID}-{uuid.uuid4().hex[:6]}")
+    client.will_set(status_topic, payload="offline", retain=True)
+    if HA_MQTT_USERNAME:
+        client.username_pw_set(HA_MQTT_USERNAME, HA_MQTT_PASSWORD or None)
+    try:
+        client.connect(HA_MQTT_BROKER, HA_MQTT_PORT, keepalive=30)
+        client.loop_start()
+        client.publish(config_topic, json.dumps(payload), retain=True)
+        client.publish(status_topic, payload="online", retain=True)
+        client.publish(attr_topic, json.dumps({"mjpeg_url": payload["mjpeg_url"], "still_image_url": payload["still_image_url"]}), retain=True)
+        log.info("Published Home Assistant MQTT discovery for %s to %s:%s", HA_CAMERA_ID, HA_MQTT_BROKER, HA_MQTT_PORT)
+    except Exception as e:
+        log.warning("Failed to publish Home Assistant discovery via MQTT: %s", e)
+    finally:
+        time.sleep(0.2)
+        try:
+            client.loop_stop()
+            client.disconnect()
+        except Exception:
+            pass
 # -----------------------------------------------------------------------------
 # Flask: headers, JSON errors, request shaping
 # -----------------------------------------------------------------------------
@@ -1265,6 +1390,15 @@ def _json_errors(err):
 def index():
     return Response(_INDEX, mimetype="text/html; charset=utf-8")
 
+
+@app.get("/.well-known/homeassistant")
+def home_assistant_well_known():
+    payload = _ha_camera_payload(_ha_base_url)
+    payload["base_url"] = _ha_base_url
+    payload["integration"] = "camera"
+    return jsonify(payload)
+
+
 @app.get("/stream.mjpg")
 def stream_mjpg():
     def generate():
@@ -1304,6 +1438,49 @@ def snapshot():
     resp = Response(data, mimetype="image/jpeg")
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
+
+# -----------------------------------------------------------------------------
+# motionEye compatibility (remote motionEye camera expects these endpoints)
+# -----------------------------------------------------------------------------
+def _motioneye_camera_descriptor() -> dict:
+    base = request.url_root.rstrip("/")
+    stream_url = f"{base}/movie/1/stream/"
+    snapshot_url = f"{base}/picture/1/current/"
+    parsed = urlsplit(base)
+    hostname = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return {
+        "id": 1,
+        "name": "obstenet",
+        "proto": request.scheme,
+        "hostname": hostname,
+        "port": port,
+        "base_url": base,
+        "stream_url": stream_url,
+        "snapshot_url": snapshot_url,
+    }
+
+
+@app.get("/config/list")
+def motioneye_config_list():
+    """Expose a minimal camera list so motionEye can treat us as a peer instance."""
+    return jsonify({"cameras": [_motioneye_camera_descriptor()]})
+
+
+@app.get("/picture/<int:cid>/current/")
+def motioneye_picture_current(cid: int):
+    """Alias to /snapshot.jpg for motionEye remote camera compatibility."""
+    if cid != 1:
+        abort(404, description="Unknown camera id")
+    return snapshot()
+
+
+@app.get("/movie/<int:cid>/stream/")
+def motioneye_movie_stream(cid: int):
+    """Alias to /stream.mjpg so motionEye can consume our live feed."""
+    if cid != 1:
+        abort(404, description="Unknown camera id")
+    return stream_mjpg()
 
 @app.get("/api/capabilities")
 def api_capabilities():
@@ -1391,12 +1568,18 @@ def api_move():
         abort(400, description="Single move too large; limit |dp|,|dt| <= 45.")
     hdp, hdt = _view_deltas_to_hw(dp, dt)
     gdp, gdt, action, v = _motion_gov.apply(hdp, hdt)
+    gdp, gdt, action, v, factor = _motion_gov.apply(hdp, hdt)
     resp = _servo.move(gdp, gdt)
     if resp is None: return jsonify({"status": "queued"}), 202
     if not resp.ok: abort(503, description=resp.error or "servo error")
     payload = resp.state or {}
     payload["power_action"] = action
     payload["voltage_v"] = v
+    payload["power_factor"] = factor
+    payload["requested_dp"] = dp
+    payload["requested_dt"] = dt
+    payload["applied_dp"] = gdp
+    payload["applied_dt"] = gdt
     return jsonify(payload)
 
 @app.post("/api/home")
@@ -1573,9 +1756,16 @@ def _camera_watchdog_loop():
                 log.error("Camera restart failed: %s", e)
 
 def _start_all() -> None:
+    global _ha_base_url
     _safe_boot_camera_with_retry()
     th = threading.Thread(target=_camera_watchdog_loop, name="camera-wd", daemon=True)
     th.start()
+    _ha_base_url = _guess_base_url()
+    if HA_DISCOVERY_ENABLE:
+        try:
+            _publish_home_assistant_mqtt(_ha_base_url)
+        except Exception as e:
+            log.warning("Home Assistant discovery failed: %s", e)
 
 # Boot subsystems
 _start_all()
