@@ -207,15 +207,21 @@ class VoltageMonitor:
         return v, uv_now, uv_seen
 
     def _read_voltage(self) -> Optional[float]:
+        """Attempt to read the 5V supply; ignore clearly invalid rails (e.g. core)."""
         try:
-            r = subprocess.run(["vcgencmd", "measure_volts"], check=False, capture_output=True, text=True, timeout=1.0)
+            # Prefer explicit rail selection if supported; Raspberry Pi's default is SoC core
+            # (~1V) which would falsely trigger the motion governor.
+            cmd = ["vcgencmd", "measure_volts", "supply"]
+            r = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=1.0)
             if r.returncode != 0:
                 return None
             out = r.stdout.strip()
             if not out.lower().startswith("volt="):
                 return None
             val = out.split("=", 1)[-1].lower().replace("v", "").strip()
-            return float(val)
+            fval = float(val)
+            # Reject implausible rails (e.g., core) so we fall back to throttled flags only.
+            return fval if fval >= 3.0 else None
         except Exception:
             return None
 
