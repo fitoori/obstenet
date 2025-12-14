@@ -221,6 +221,12 @@ class VoltageMonitor:
         return v, uv_now, uv_seen
 
     def _read_voltage(self) -> Optional[float]:
+        """Attempt to read the 5V supply; ignore clearly invalid rails (e.g. core)."""
+        try:
+            # Prefer explicit rail selection if supported; Raspberry Pi's default is SoC core
+            # (~1V) which would falsely trigger the motion governor.
+            cmd = ["vcgencmd", "measure_volts", "supply"]
+            r = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=1.0)
         try:
             r = subprocess.run(["vcgencmd", "measure_volts"], check=False, capture_output=True, text=True, timeout=1.0)
             if r.returncode != 0:
@@ -229,6 +235,9 @@ class VoltageMonitor:
             if not out.lower().startswith("volt="):
                 return None
             val = out.split("=", 1)[-1].lower().replace("v", "").strip()
+            fval = float(val)
+            # Reject implausible rails (e.g., core) so we fall back to throttled flags only.
+            return fval if fval >= 3.0 else None
             return float(val)
         except Exception:
             return None
@@ -287,6 +296,9 @@ class MotionGovernor:
         span = max(1e-6, hi - lo)
         return floor + ((v - lo) / span) * (1.0 - floor)
 
+    def apply(self, dp: float, dt: float) -> Tuple[float, float, str, Optional[float]]:
+        if not self._enabled or not self._monitor.available():
+            return dp, dt, "bypass", None
     def apply(self, dp: float, dt: float) -> Tuple[float, float, str, Optional[float], float]:
         if not self._enabled or not self._monitor.available():
             return dp, dt, "bypass", None, 1.0
@@ -305,6 +317,7 @@ class MotionGovernor:
                 dp *= factor; dt *= factor
 
         self._log_transition(action, v, dp, dt, factor)
+        return dp, dt, action, v
         return dp, dt, action, v, factor
 
     def _log_transition(self, action: str, v: Optional[float], dp: float, dt: float, factor: float) -> None:
@@ -1581,6 +1594,7 @@ def api_move():
     if abs(dp) > 45 or abs(dt) > 45:
         abort(400, description="Single move too large; limit |dp|,|dt| <= 45.")
     hdp, hdt = _view_deltas_to_hw(dp, dt)
+    gdp, gdt, action, v = _motion_gov.apply(hdp, hdt)
     gdp, gdt, action, v, factor = _motion_gov.apply(hdp, hdt)
     resp = _servo.move(gdp, gdt)
     if resp is None: return jsonify({"status": "queued"}), 202
