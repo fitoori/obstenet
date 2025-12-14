@@ -1132,6 +1132,46 @@ def snapshot():
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
+# -----------------------------------------------------------------------------
+# motionEye compatibility (remote motionEye camera expects these endpoints)
+# -----------------------------------------------------------------------------
+def _motioneye_camera_descriptor() -> dict:
+    base = request.url_root.rstrip("/")
+    stream_url = f"{base}/movie/1/stream/"
+    snapshot_url = f"{base}/picture/1/current/"
+    return {
+        "id": 1,
+        "name": "obstenet",
+        "proto": request.scheme,
+        "hostname": request.host.split(":")[0],
+        "port": int(request.host.split(":", 1)[1]) if ":" in request.host else 80,
+        "base_url": base,
+        "stream_url": stream_url,
+        "snapshot_url": snapshot_url,
+    }
+
+
+@app.get("/config/list")
+def motioneye_config_list():
+    """Expose a minimal camera list so motionEye can treat us as a peer instance."""
+    return jsonify({"cameras": [_motioneye_camera_descriptor()]})
+
+
+@app.get("/picture/<int:cid>/current/")
+def motioneye_picture_current(cid: int):
+    """Alias to /snapshot.jpg for motionEye remote camera compatibility."""
+    if cid != 1:
+        abort(404, description="Unknown camera id")
+    return snapshot()
+
+
+@app.get("/movie/<int:cid>/stream/")
+def motioneye_movie_stream(cid: int):
+    """Alias to /stream.mjpg so motionEye can consume our live feed."""
+    if cid != 1:
+        abort(404, description="Unknown camera id")
+    return stream_mjpg()
+
 @app.get("/api/capabilities")
 def api_capabilities():
     led_present = _LED_PATHS is not None
