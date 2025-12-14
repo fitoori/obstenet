@@ -48,6 +48,16 @@ SERVO_RELEASE_AFTER_ACTION: bool = False
 SERVO_RELEASE_SETTLE_S: float = 0.15
 SERVO_SEND_TIMEOUT_S: float = 6.0
 
+# --- Power management / brownout avoidance ---
+POWER_MGMT_ENABLED: bool = True
+POWER_SAMPLE_RATE_HZ: float = 10.0
+POWER_WARN_VOLTS: float = 4.90
+POWER_LIMIT_VOLTS: float = 4.75
+POWER_CUTOFF_VOLTS: float = 4.65
+POWER_SCALE_HORIZONTAL: float = 0.8
+POWER_SCALE_VERTICAL_DOWN: float = 0.6
+POWER_SCALE_VERTICAL_UP: float = 0.3
+
 # --- Gestures (macros) ---
 GESTURE_AMPLITUDE_DEG: int = 15
 GESTURE_CYCLES: int = 1
@@ -79,6 +89,7 @@ import json
 import logging
 import os
 import resource
+import shutil
 import signal
 import socket
 import struct
@@ -86,6 +97,7 @@ import sys
 import threading
 import time
 import uuid
+import subprocess
 from collections import deque, defaultdict
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple, List
@@ -143,6 +155,160 @@ except Exception:
 # -----------------------------------------------------------------------------
 def _clamp(x: float, lo: float, hi: float) -> int:
     return int(lo) if x < lo else int(hi) if x > hi else int(round(x))
+
+
+class VoltageMonitor:
+    """Sample supply voltage periodically with Raspberry Pi vcgencmd backend."""
+
+    def __init__(self, enabled: bool = True, sample_hz: float = POWER_SAMPLE_RATE_HZ) -> None:
+        self._enabled = bool(enabled)
+        self._sample_hz = max(0.1, float(sample_hz))
+        self._last_v: Optional[float] = None
+        self._uv_now = False
+        self._uv_seen = False
+        self._lock = threading.Lock()
+        self._stop_evt = threading.Event()
+        self._th: Optional[threading.Thread] = None
+        self._supported = shutil.which("vcgencmd") is not None
+        self._logged_unavail = False
+
+    def start(self) -> None:
+        if not self._enabled:
+            return
+        if not self._supported:
+            if not self._logged_unavail:
+                log.warning("Voltage monitor disabled: vcgencmd not available.")
+                self._logged_unavail = True
+            return
+        if self._th and self._th.is_alive():
+            return
+        self._stop_evt.clear()
+        self._th = threading.Thread(target=self._run, name="vmon", daemon=True)
+        self._th.start()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+
+    def _run(self) -> None:
+        while not self._stop_evt.is_set():
+            try:
+                v, uv_now, uv_seen = self._sample_once()
+                with self._lock:
+                    self._last_v = v
+                    self._uv_now = uv_now
+                    self._uv_seen = uv_seen
+            except Exception:
+                pass
+            time.sleep(1.0 / self._sample_hz)
+
+    def _sample_once(self) -> Tuple[Optional[float], bool, bool]:
+        v = self._read_voltage()
+        uv_now, uv_seen = self._read_throttled()
+        return v, uv_now, uv_seen
+
+    def _read_voltage(self) -> Optional[float]:
+        try:
+            r = subprocess.run(["vcgencmd", "measure_volts"], check=False, capture_output=True, text=True, timeout=1.0)
+            if r.returncode != 0:
+                return None
+            out = r.stdout.strip()
+            if not out.lower().startswith("volt="):
+                return None
+            val = out.split("=", 1)[-1].lower().replace("v", "").strip()
+            return float(val)
+        except Exception:
+            return None
+
+    def _read_throttled(self) -> Tuple[bool, bool]:
+        try:
+            r = subprocess.run(["vcgencmd", "get_throttled"], check=False, capture_output=True, text=True, timeout=1.0)
+            if r.returncode != 0:
+                return False, False
+            out = r.stdout.strip().lower()
+            if "0x" in out:
+                val = int(out.split("0x", 1)[-1], 16)
+                uv_now = bool(val & 0x1)
+                uv_seen = bool(val & 0x10000)
+                return uv_now, uv_seen
+        except Exception:
+            pass
+        return False, False
+
+    def voltage(self) -> Optional[float]:
+        with self._lock:
+            return self._last_v
+
+    def undervoltage_now(self) -> bool:
+        with self._lock:
+            return bool(self._uv_now)
+
+    def undervoltage_seen(self) -> bool:
+        with self._lock:
+            return bool(self._uv_seen)
+
+    def available(self) -> bool:
+        return self._enabled and self._supported
+
+
+class MotionGovernor:
+    """Scale motion commands based on available voltage margin."""
+
+    def __init__(self, monitor: VoltageMonitor, enabled: bool = POWER_MGMT_ENABLED) -> None:
+        self._monitor = monitor
+        self._enabled = bool(enabled)
+        self._last_state = "normal"
+
+    def _axis_floor(self, dp: float, dt: float) -> float:
+        if abs(dt) > abs(dp):
+            if dt < 0:
+                return POWER_SCALE_VERTICAL_UP
+            return POWER_SCALE_VERTICAL_DOWN
+        return POWER_SCALE_HORIZONTAL
+
+    def _interp(self, v: float, hi: float, lo: float, floor: float) -> float:
+        if v >= hi:
+            return 1.0
+        if v <= lo:
+            return floor
+        span = max(1e-6, hi - lo)
+        return floor + ((v - lo) / span) * (1.0 - floor)
+
+    def apply(self, dp: float, dt: float) -> Tuple[float, float, str, Optional[float]]:
+        if not self._enabled or not self._monitor.available():
+            return dp, dt, "bypass", None
+        v = self._monitor.voltage()
+        uv = self._monitor.undervoltage_now() or self._monitor.undervoltage_seen()
+        action = "normal"
+        factor = 1.0
+        if uv or (v is not None and v <= POWER_CUTOFF_VOLTS):
+            action = "inhibit"
+            dp = 0.0; dt = 0.0
+        elif v is not None:
+            floor = self._axis_floor(dp, dt)
+            factor = self._interp(v, POWER_WARN_VOLTS, POWER_LIMIT_VOLTS, floor)
+            if factor < 0.999:
+                action = "scale"
+                dp *= factor; dt *= factor
+
+        self._log_transition(action, v, dp, dt, factor)
+        return dp, dt, action, v
+
+    def _log_transition(self, action: str, v: Optional[float], dp: float, dt: float, factor: float) -> None:
+        state_key = f"{action}-{int(round((v or 0.0)*100))}"
+        if state_key == self._last_state:
+            return
+        self._last_state = state_key
+        if action == "inhibit":
+            log.warning("POWER CUTOFF v=%.2fV action=inhibit", v if v is not None else -1.0)
+        elif action == "scale":
+            axis = "vertical_up" if abs(dt) >= abs(dp) and dt < 0 else "vertical_down" if abs(dt) >= abs(dp) else "horizontal"
+            log.warning("POWER WARN v=%.2fV action=scale axis=%s factor=%.2f dp=%.2f dt=%.2f", v if v is not None else -1.0, axis, factor, dp, dt)
+        elif action == "normal" and v is not None:
+            log.info("POWER RECOVER v=%.2fV action=resume", v)
+
+
+_voltage_monitor = VoltageMonitor(enabled=POWER_MGMT_ENABLED, sample_hz=POWER_SAMPLE_RATE_HZ)
+_motion_gov = MotionGovernor(_voltage_monitor, enabled=POWER_MGMT_ENABLED)
 
 @dataclass
 class _Cmd:
@@ -619,6 +785,7 @@ class ServoManager:
         rid = str(uuid.uuid4()); return self._send(_Cmd(rid=rid, op="release"), wait=True)
 
 _servo = ServoManager(); _servo.start()
+_voltage_monitor.start()
 
 # -----------------------------------------------------------------------------
 # Video pipeline & camera management (lower latency + watchdog)
@@ -1217,10 +1384,14 @@ def api_move():
     if abs(dp) > 45 or abs(dt) > 45:
         abort(400, description="Single move too large; limit |dp|,|dt| <= 45.")
     hdp, hdt = _view_deltas_to_hw(dp, dt)
-    resp = _servo.move(hdp, hdt)
+    gdp, gdt, action, v = _motion_gov.apply(hdp, hdt)
+    resp = _servo.move(gdp, gdt)
     if resp is None: return jsonify({"status": "queued"}), 202
     if not resp.ok: abort(503, description=resp.error or "servo error")
-    return jsonify(resp.state or {})
+    payload = resp.state or {}
+    payload["power_action"] = action
+    payload["voltage_v"] = v
+    return jsonify(payload)
 
 @app.post("/api/home")
 def api_home():
