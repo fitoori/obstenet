@@ -21,11 +21,10 @@ OBSTENET (Opposable Bounded Surveillance & Tracking with Elastic Networking) is 
    sudo apt install -y python3-picamera2 python3-libcamera python3-venv
    ```
 
-2. **Enable I²C and install the Pan-Tilt driver**
+2. **Enable I²C**
 
    ```bash
    sudo raspi-config nonint do_i2c 0
-   python3 -m pip install --upgrade pantilthat smbus2
    ```
 
 3. **Create and activate a virtual environment** (recommended)
@@ -35,13 +34,13 @@ OBSTENET (Opposable Bounded Surveillance & Tracking with Elastic Networking) is 
    source .venv/bin/activate
    ```
 
-4. **Install Python dependencies**
+4. **Install Python dependencies inside the virtual environment**
 
-   Flask is the only required Python package beyond the hardware libraries:
+   Install the hardware libraries after the environment is active so they are available to the application:
 
    ```bash
    python -m pip install --upgrade pip
-   python -m pip install Flask
+   python -m pip install pantilthat smbus2 Flask
    ```
 
 ## Running the server
