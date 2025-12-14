@@ -72,6 +72,17 @@ CAM_RESTARTS_MAX_PER_HOUR: int = 120
 # --- Resilience: request shaping ---
 MOVE_MIN_INTERVAL_S: float = 0.02
 
+# --- Home Assistant integration / discovery ---
+HA_DISCOVERY_ENABLE: bool = os.environ.get("HA_DISCOVERY", "0").lower() in ("1", "true", "yes", "on")
+HA_MQTT_BROKER: Optional[str] = os.environ.get("HA_MQTT_BROKER")
+HA_MQTT_PORT: int = int(os.environ.get("HA_MQTT_PORT", "1883"))
+HA_MQTT_USERNAME: Optional[str] = os.environ.get("HA_MQTT_USERNAME")
+HA_MQTT_PASSWORD: Optional[str] = os.environ.get("HA_MQTT_PASSWORD")
+HA_MQTT_BASE_TOPIC: str = os.environ.get("HA_MQTT_BASE_TOPIC", "homeassistant")
+HA_BASE_URL: Optional[str] = os.environ.get("HA_BASE_URL")
+HA_CAMERA_NAME: str = os.environ.get("HA_CAMERA_NAME", "Obstenet Camera")
+HA_CAMERA_ID: str = os.environ.get("HA_CAMERA_ID", "obstenet_cam")
+
 import atexit
 import glob
 import io
@@ -1031,6 +1042,96 @@ def _pick_host() -> str:
         return HOST
     return HOST
 
+
+def _guess_base_url() -> str:
+    """Best effort HTTP base URL for discovery (mDNS/MQTT)."""
+    if HA_BASE_URL:
+        return HA_BASE_URL.rstrip("/")
+
+    candidates: list[str] = []
+    for iface in ("tailscale0", "wlan0", "eth0", "en0"):
+        ip = _iface_ipv4(iface)
+        if ip:
+            candidates.append(ip)
+    try:
+        hostname_ip = socket.gethostbyname(socket.gethostname())
+        if hostname_ip:
+            candidates.append(hostname_ip)
+    except Exception:
+        pass
+    host = next((c for c in candidates if c and not c.startswith("127.")), "127.0.0.1")
+    return f"http://{host}:{PORT}"
+
+
+def _ha_device_info() -> Dict[str, object]:
+    return {
+        "identifiers": ["obstenet", HA_CAMERA_ID],
+        "manufacturer": "Obstenet",
+        "model": "PanTilt Camera",
+        "name": HA_CAMERA_NAME,
+    }
+
+
+def _ha_camera_payload(base_url: str) -> Dict[str, object]:
+    urls = {
+        "mjpeg_url": f"{base_url}/stream.mjpg",
+        "still_image_url": f"{base_url}/snapshot.jpg",
+        "stream_source": f"{base_url}/stream.mjpg",
+        "control_api": f"{base_url}/api",
+    }
+    return {
+        "name": HA_CAMERA_NAME,
+        "unique_id": HA_CAMERA_ID,
+        "device": _ha_device_info(),
+        "availability_topic": f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/status",
+        "payload_available": "online",
+        "payload_not_available": "offline",
+        "json_attributes_topic": f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/attributes",
+        # Home Assistant Generic camera uses these URLs; stream_source helps the stream component.
+        **urls,
+    }
+
+
+_ha_base_url: str = _guess_base_url()
+
+
+def _publish_home_assistant_mqtt(base_url: str) -> None:
+    if not HA_DISCOVERY_ENABLE:
+        return
+    if not HA_MQTT_BROKER:
+        log.info("HA discovery requested but HA_MQTT_BROKER not set; skipping MQTT publish.")
+        return
+    try:
+        import paho.mqtt.client as mqtt
+    except Exception as e:
+        log.warning("HA discovery enabled but paho-mqtt is missing: %s", e)
+        return
+
+    config_topic = f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/config"
+    status_topic = f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/status"
+    attr_topic = f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/attributes"
+    payload = _ha_camera_payload(base_url)
+
+    client = mqtt.Client(client_id=f"{HA_CAMERA_ID}-{uuid.uuid4().hex[:6]}")
+    client.will_set(status_topic, payload="offline", retain=True)
+    if HA_MQTT_USERNAME:
+        client.username_pw_set(HA_MQTT_USERNAME, HA_MQTT_PASSWORD or None)
+    try:
+        client.connect(HA_MQTT_BROKER, HA_MQTT_PORT, keepalive=30)
+        client.loop_start()
+        client.publish(config_topic, json.dumps(payload), retain=True)
+        client.publish(status_topic, payload="online", retain=True)
+        client.publish(attr_topic, json.dumps({"mjpeg_url": payload["mjpeg_url"], "still_image_url": payload["still_image_url"]}), retain=True)
+        log.info("Published Home Assistant MQTT discovery for %s to %s:%s", HA_CAMERA_ID, HA_MQTT_BROKER, HA_MQTT_PORT)
+    except Exception as e:
+        log.warning("Failed to publish Home Assistant discovery via MQTT: %s", e)
+    finally:
+        time.sleep(0.2)
+        try:
+            client.loop_stop()
+            client.disconnect()
+        except Exception:
+            pass
 # -----------------------------------------------------------------------------
 # Flask: headers, JSON errors, request shaping
 # -----------------------------------------------------------------------------
@@ -1091,6 +1192,15 @@ def _json_errors(err):
 @app.get("/")
 def index():
     return Response(_INDEX, mimetype="text/html; charset=utf-8")
+
+
+@app.get("/.well-known/homeassistant")
+def home_assistant_well_known():
+    payload = _ha_camera_payload(_ha_base_url)
+    payload["base_url"] = _ha_base_url
+    payload["integration"] = "camera"
+    return jsonify(payload)
+
 
 @app.get("/stream.mjpg")
 def stream_mjpg():
@@ -1396,9 +1506,16 @@ def _camera_watchdog_loop():
                 log.error("Camera restart failed: %s", e)
 
 def _start_all() -> None:
+    global _ha_base_url
     _safe_boot_camera_with_retry()
     th = threading.Thread(target=_camera_watchdog_loop, name="camera-wd", daemon=True)
     th.start()
+    _ha_base_url = _guess_base_url()
+    if HA_DISCOVERY_ENABLE:
+        try:
+            _publish_home_assistant_mqtt(_ha_base_url)
+        except Exception as e:
+            log.warning("Home Assistant discovery failed: %s", e)
 
 # Boot subsystems
 _start_all()
