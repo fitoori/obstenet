@@ -83,7 +83,7 @@ CAM_RESTARTS_MAX_PER_HOUR: int = 120
 MOVE_MIN_INTERVAL_S: float = 0.02
 
 import os
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 # --- Home Assistant integration / discovery ---
 HA_DISCOVERY_ENABLE: bool = os.environ.get("HA_DISCOVERY", "0").lower() in ("1", "true", "yes", "on")
@@ -96,6 +96,7 @@ HA_BASE_URL: Optional[str] = os.environ.get("HA_BASE_URL")
 HA_CAMERA_NAME: str = os.environ.get("HA_CAMERA_NAME", "Obstenet Camera")
 HA_CAMERA_ID: str = os.environ.get("HA_CAMERA_ID", "obstenet_cam")
 
+import argparse
 import atexit
 import glob
 import io
@@ -119,29 +120,61 @@ import faulthandler
 from flask import Flask, Response, abort, jsonify, request, make_response
 from urllib.parse import urlsplit
 
-# Hardware libs (fail-fast with guidance)
-try:
-    from picamera2 import Picamera2
-    from picamera2.encoders import JpegEncoder
-    from picamera2.outputs import FileOutput
-    from libcamera import Transform
-except Exception as e:
-    sys.stderr.write(
-        "ERROR: Picamera2/libcamera required. Install with:\n"
-        "  sudo apt update && sudo apt install -y python3-picamera2\n"
-        f"Import failed: {e}\n"
-    ); sys.exit(2)
-
-try:
-    import pantilthat
-except Exception as e:
-    sys.stderr.write(
-        "ERROR: pantilthat required. Enable I2C in raspi-config and:\n"
-        "  python3 -m pip install --upgrade pantilthat\n"
-        f"Import failed: {e}\n"
-    ); sys.exit(2)
-
 from multiprocessing import Process, Queue as MPQueue, Event as MPEvent
+
+if TYPE_CHECKING:  # pragma: no cover - import-only for type checkers
+    from picamera2 import Picamera2  # noqa: F401
+    from picamera2.encoders import JpegEncoder  # noqa: F401
+    from picamera2.outputs import FileOutput  # noqa: F401
+    from libcamera import Transform  # noqa: F401
+
+# Hardware libs are imported lazily to allow diagnostics to run without hardware.
+Picamera2 = None
+JpegEncoder = None
+FileOutput = None
+Transform = None
+pantilthat = None
+
+
+def _import_dependencies(strict: bool = True) -> dict[str, str]:
+    """Import required hardware libraries with helpful diagnostics."""
+
+    missing: dict[str, str] = {}
+    global Picamera2, JpegEncoder, FileOutput, Transform, pantilthat
+
+    if Picamera2 is None or JpegEncoder is None or FileOutput is None or Transform is None:
+        try:
+            from picamera2 import Picamera2 as _Picamera2  # type: ignore
+            from picamera2.encoders import JpegEncoder as _JpegEncoder  # type: ignore
+            from picamera2.outputs import FileOutput as _FileOutput  # type: ignore
+            from libcamera import Transform as _Transform  # type: ignore
+            Picamera2, JpegEncoder, FileOutput, Transform = _Picamera2, _JpegEncoder, _FileOutput, _Transform
+        except Exception as e:  # pragma: no cover - relies on platform packages
+            missing["picamera2/libcamera"] = str(e)
+
+    if pantilthat is None:
+        try:
+            import pantilthat as _pantilthat  # type: ignore
+            pantilthat = _pantilthat
+        except Exception as e:  # pragma: no cover - relies on hardware libs
+            missing["pantilthat"] = str(e)
+
+    if missing and strict:
+        if "picamera2/libcamera" in missing:
+            sys.stderr.write(
+                "ERROR: Picamera2/libcamera required. Install with:\n"
+                "  sudo apt update && sudo apt install -y python3-picamera2\n"
+                f"Import failed: {missing['picamera2/libcamera']}\n"
+            )
+        if "pantilthat" in missing:
+            sys.stderr.write(
+                "ERROR: pantilthat required. Enable I2C in raspi-config and:\n"
+                "  python3 -m pip install --upgrade pantilthat\n"
+                f"Import failed: {missing['pantilthat']}\n"
+            )
+        sys.exit(2)
+
+    return missing
 
 # -----------------------------------------------------------------------------
 # Logging / crash diagnostics
@@ -793,8 +826,7 @@ class ServoManager:
     def release(self):
         rid = str(uuid.uuid4()); return self._send(_Cmd(rid=rid, op="release"), wait=True)
 
-_servo = ServoManager(); _servo.start()
-_voltage_monitor.start()
+_servo = ServoManager()
 
 # -----------------------------------------------------------------------------
 # Video pipeline & camera management (lower latency + watchdog)
@@ -1283,6 +1315,8 @@ def _ha_camera_payload(base_url: str) -> Dict[str, object]:
 
 _ha_base_url: str = _guess_base_url()
 
+_runtime_started = False
+
 
 def _publish_home_assistant_mqtt(base_url: str) -> None:
     if not HA_DISCOVERY_ENABLE:
@@ -1768,8 +1802,14 @@ def _camera_watchdog_loop():
             except Exception as e:
                 log.error("Camera restart failed: %s", e)
 
-def _start_all() -> None:
-    global _ha_base_url
+def _start_all(force: bool = False) -> None:
+    global _ha_base_url, _runtime_started
+    if _runtime_started and not force:
+        return
+
+    _import_dependencies(strict=True)
+    _voltage_monitor.start()
+    _servo.start()
     _safe_boot_camera_with_retry()
     th = threading.Thread(target=_camera_watchdog_loop, name="camera-wd", daemon=True)
     th.start()
@@ -1779,9 +1819,7 @@ def _start_all() -> None:
             _publish_home_assistant_mqtt(_ha_base_url)
         except Exception as e:
             log.warning("Home Assistant discovery failed: %s", e)
-
-# Boot subsystems
-_start_all()
+    _runtime_started = True
 
 # -----------------------------------------------------------------------------
 # View delta mapping (unchanged)
@@ -1798,13 +1836,65 @@ def _view_deltas_to_hw(dp: float, dt: float) -> Tuple[float, float]:
     if INVERT_UI_UPDOWN:    vy = -vy
     return vx, vy
 
+
+def _run_diagnostics() -> int:
+    """Basic environment and dependency checks for production readiness."""
+
+    results: list[tuple[str, bool, str]] = []
+
+    def add(name: str, ok: bool, detail: str) -> None:
+        results.append((name, ok, detail))
+
+    py_ok = sys.version_info >= (3, 10)
+    add("Python version", py_ok, sys.version.split(" ")[0])
+
+    missing = _import_dependencies(strict=False)
+    add("picamera2/libcamera", "picamera2/libcamera" not in missing, missing.get("picamera2/libcamera", "available"))
+    add("pantilthat", "pantilthat" not in missing, missing.get("pantilthat", "available"))
+
+    vcmd = shutil.which("vcgencmd")
+    add("vcgencmd", bool(vcmd), vcmd or "not found")
+
+    add("I2C bus (/dev/i2c-1)", os.path.exists("/dev/i2c-1"), "present" if os.path.exists("/dev/i2c-1") else "missing")
+    add("Camera device (/dev/video0)", os.path.exists("/dev/video0"), "present" if os.path.exists("/dev/video0") else "missing")
+
+    log.info("OBSTENET diagnostics:")
+    for name, ok, detail in results:
+        log.info("  %-24s : %s (%s)", name, "OK" if ok else "FAIL", detail)
+
+    all_ok = all(ok for _, ok, _ in results)
+    if not all_ok:
+        log.error("Diagnostics completed with failures. Resolve the issues above before production use.")
+    else:
+        log.info("Diagnostics completed successfully. System appears production-ready.")
+    return 0 if all_ok else 1
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-if __name__ == "__main__":
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Obstenet pan/tilt camera controller")
+    parser.add_argument("--host", help="Override bind host (defaults to BIND_MODE logic)")
+    parser.add_argument("--port", type=int, help="Override bind port (default: 8000)")
+    parser.add_argument("--diagnostic", action="store_true", help="Run dependency diagnostics and exit")
+    args = parser.parse_args(argv)
+
+    if args.port is not None:
+        global PORT
+        PORT = args.port
+    if args.host:
+        global HOST
+        HOST = args.host
+
+    if args.diagnostic:
+        sys.exit(_run_diagnostics())
+
     if (STREAM_ROTATION % 360) not in (0, 90, 180, 270):
         sys.stderr.write("STREAM_ROTATION must be 0/90/180/270\n"); sys.exit(3)
-    bind_host = _pick_host()
+
+    _start_all()
+
+    bind_host = args.host or _pick_host()
     try:
         app.run(host=bind_host, port=PORT, debug=False, threaded=True)
     except OSError as e:
@@ -1814,3 +1904,7 @@ if __name__ == "__main__":
         except Exception as e2:
             sys.stderr.write(f"ERROR: Fallback bind failed: {e2}\n")
             sys.exit(4)
+
+
+if __name__ == "__main__":
+    main()
