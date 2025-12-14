@@ -1263,13 +1263,18 @@ def _ha_camera_payload(base_url: str) -> Dict[str, object]:
         "stream_source": f"{base_url}/stream.mjpg",
         "control_api": f"{base_url}/api",
     }
+    availability_topic = f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/status"
     return {
         "name": HA_CAMERA_NAME,
         "unique_id": HA_CAMERA_ID,
         "device": _ha_device_info(),
-        "availability_topic": f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/status",
-        "payload_available": "online",
-        "payload_not_available": "offline",
+        # Home Assistant MQTT discovery for cameras expects the structured availability
+        # block instead of legacy availability_topic fields.
+        "availability": [{
+            "topic": availability_topic,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+        }],
         "json_attributes_topic": f"{HA_MQTT_BASE_TOPIC}/camera/{HA_CAMERA_ID}/attributes",
         # Home Assistant Generic camera uses these URLs; stream_source helps the stream component.
         **urls,
@@ -1305,7 +1310,12 @@ def _publish_home_assistant_mqtt(base_url: str) -> None:
         client.loop_start()
         client.publish(config_topic, json.dumps(payload), retain=True)
         client.publish(status_topic, payload="online", retain=True)
-        client.publish(attr_topic, json.dumps({"mjpeg_url": payload["mjpeg_url"], "still_image_url": payload["still_image_url"]}), retain=True)
+        client.publish(attr_topic, json.dumps({
+            "mjpeg_url": payload["mjpeg_url"],
+            "still_image_url": payload["still_image_url"],
+            "control_api": payload["control_api"],
+            "base_url": base_url,
+        }), retain=True)
         log.info("Published Home Assistant MQTT discovery for %s to %s:%s", HA_CAMERA_ID, HA_MQTT_BROKER, HA_MQTT_PORT)
     except Exception as e:
         log.warning("Failed to publish Home Assistant discovery via MQTT: %s", e)
@@ -1380,9 +1390,21 @@ def index():
 
 @app.get("/.well-known/homeassistant")
 def home_assistant_well_known():
-    payload = _ha_camera_payload(_ha_base_url)
-    payload["base_url"] = _ha_base_url
-    payload["integration"] = "camera"
+    payload = {
+        # Home Assistant companion apps expect this key for discovery. It must be a fully
+        # qualified URL reachable by the device performing discovery.
+        "base_url": _ha_base_url,
+        "uuid": HA_CAMERA_ID,
+        "name": HA_CAMERA_NAME,
+        "device": _ha_device_info(),
+        "services": {
+            "camera": {
+                "mjpeg_url": f"{_ha_base_url}/stream.mjpg",
+                "still_image_url": f"{_ha_base_url}/snapshot.jpg",
+                "control_api": f"{_ha_base_url}/api",
+            }
+        },
+    }
     return jsonify(payload)
 
 
@@ -1445,6 +1467,11 @@ def _motioneye_camera_descriptor() -> dict:
         "base_url": base,
         "stream_url": stream_url,
         "snapshot_url": snapshot_url,
+        # motionEye expects remote peers to advertise a netcam_url and whether the feed
+        # is enabled. We map these to our MJPEG stream and always expose a single camera.
+        "enabled": True,
+        "netcam_url": stream_url,
+        "netcam_userpass": "",
     }
 
 
