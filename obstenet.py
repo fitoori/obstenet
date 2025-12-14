@@ -72,6 +72,9 @@ CAM_RESTARTS_MAX_PER_HOUR: int = 120
 # --- Resilience: request shaping ---
 MOVE_MIN_INTERVAL_S: float = 0.02
 
+import os
+from typing import Optional
+
 # --- Home Assistant integration / discovery ---
 HA_DISCOVERY_ENABLE: bool = os.environ.get("HA_DISCOVERY", "0").lower() in ("1", "true", "yes", "on")
 HA_MQTT_BROKER: Optional[str] = os.environ.get("HA_MQTT_BROKER")
@@ -88,7 +91,6 @@ import glob
 import io
 import json
 import logging
-import os
 import resource
 import signal
 import socket
@@ -99,7 +101,7 @@ import time
 import uuid
 from collections import deque, defaultdict
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple, List
+from typing import Dict, Tuple, List
 
 import faulthandler
 from flask import Flask, Response, abort, jsonify, request, make_response
