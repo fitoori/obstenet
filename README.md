@@ -52,6 +52,12 @@ With dependencies installed and the virtual environment activated, start OBSTENE
 python obstenet.py
 ```
 
+Use `--host` or `--port` to override the defaults, or `--diagnostic` to run production readiness checks without starting the server:
+
+```bash
+python obstenet.py --diagnostic
+```
+
 By default the HTTP server binds to `0.0.0.0:8000`. Ensure the camera and servos are connected before launching to avoid startup failures.
 
 ## Troubleshooting
