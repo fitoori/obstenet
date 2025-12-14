@@ -105,6 +105,7 @@ from typing import Dict, Tuple, List
 
 import faulthandler
 from flask import Flask, Response, abort, jsonify, request, make_response
+from urllib.parse import urlsplit
 
 # Hardware libs (fail-fast with guidance)
 try:
@@ -1243,6 +1244,49 @@ def snapshot():
     resp = Response(data, mimetype="image/jpeg")
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
+
+# -----------------------------------------------------------------------------
+# motionEye compatibility (remote motionEye camera expects these endpoints)
+# -----------------------------------------------------------------------------
+def _motioneye_camera_descriptor() -> dict:
+    base = request.url_root.rstrip("/")
+    stream_url = f"{base}/movie/1/stream/"
+    snapshot_url = f"{base}/picture/1/current/"
+    parsed = urlsplit(base)
+    hostname = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return {
+        "id": 1,
+        "name": "obstenet",
+        "proto": request.scheme,
+        "hostname": hostname,
+        "port": port,
+        "base_url": base,
+        "stream_url": stream_url,
+        "snapshot_url": snapshot_url,
+    }
+
+
+@app.get("/config/list")
+def motioneye_config_list():
+    """Expose a minimal camera list so motionEye can treat us as a peer instance."""
+    return jsonify({"cameras": [_motioneye_camera_descriptor()]})
+
+
+@app.get("/picture/<int:cid>/current/")
+def motioneye_picture_current(cid: int):
+    """Alias to /snapshot.jpg for motionEye remote camera compatibility."""
+    if cid != 1:
+        abort(404, description="Unknown camera id")
+    return snapshot()
+
+
+@app.get("/movie/<int:cid>/stream/")
+def motioneye_movie_stream(cid: int):
+    """Alias to /stream.mjpg so motionEye can consume our live feed."""
+    if cid != 1:
+        abort(404, description="Unknown camera id")
+    return stream_mjpg()
 
 @app.get("/api/capabilities")
 def api_capabilities():
