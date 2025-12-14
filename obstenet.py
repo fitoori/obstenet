@@ -92,6 +92,7 @@ from typing import Optional, Dict, Tuple, List
 
 import faulthandler
 from flask import Flask, Response, abort, jsonify, request, make_response
+from urllib.parse import urlsplit
 
 # Hardware libs (fail-fast with guidance)
 try:
@@ -1139,12 +1140,15 @@ def _motioneye_camera_descriptor() -> dict:
     base = request.url_root.rstrip("/")
     stream_url = f"{base}/movie/1/stream/"
     snapshot_url = f"{base}/picture/1/current/"
+    parsed = urlsplit(base)
+    hostname = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     return {
         "id": 1,
         "name": "obstenet",
         "proto": request.scheme,
-        "hostname": request.host.split(":")[0],
-        "port": int(request.host.split(":", 1)[1]) if ":" in request.host else 80,
+        "hostname": hostname,
+        "port": port,
         "base_url": base,
         "stream_url": stream_url,
         "snapshot_url": snapshot_url,
