@@ -338,16 +338,18 @@ class MotionGovernor:
         span = max(1e-6, hi - lo)
         return floor + ((v - lo) / span) * (1.0 - floor)
 
-    def apply(self, dp: float, dt: float) -> Tuple[float, float, str, Optional[float], float]:
+    def apply(self, dp: float, dt: float) -> Tuple[float, float, str, Optional[float], float, bool]:
         if not self._enabled or not self._monitor.available():
-            return dp, dt, "bypass", None, 1.0
+            return dp, dt, "bypass", None, 1.0, False
         v = self._monitor.voltage()
         uv = self._monitor.undervoltage_now() or self._monitor.undervoltage_seen()
         action = "normal"
         factor = 1.0
+        recovered = False
         if uv or (v is not None and v <= POWER_CUTOFF_VOLTS):
             action = "inhibit"
             dp = 0.0; dt = 0.0
+            recovered = _recover_voltage_for_motion()
         elif v is not None:
             floor = self._axis_floor(dp, dt)
             factor = self._interp(v, POWER_WARN_VOLTS, POWER_LIMIT_VOLTS, floor)
@@ -355,16 +357,16 @@ class MotionGovernor:
                 action = "scale"
                 dp *= factor; dt *= factor
 
-        self._log_transition(action, v, dp, dt, factor)
-        return dp, dt, action, v, factor
+        self._log_transition(action, v, dp, dt, factor, recovered)
+        return dp, dt, action, v, factor, recovered
 
-    def _log_transition(self, action: str, v: Optional[float], dp: float, dt: float, factor: float) -> None:
+    def _log_transition(self, action: str, v: Optional[float], dp: float, dt: float, factor: float, recovered: bool) -> None:
         state_key = f"{action}-{int(round((v or 0.0)*100))}"
         if state_key == self._last_state:
             return
         self._last_state = state_key
         if action == "inhibit":
-            log.warning("POWER CUTOFF v=%.2fV action=inhibit", v if v is not None else -1.0)
+            log.warning("POWER CUTOFF v=%.2fV action=inhibit recovered=%s", v if v is not None else -1.0, recovered)
         elif action == "scale":
             axis = "vertical_up" if abs(dt) >= abs(dp) and dt < 0 else "vertical_down" if abs(dt) >= abs(dp) else "horizontal"
             log.warning("POWER WARN v=%.2fV action=scale axis=%s factor=%.2f dp=%.2f dt=%.2f", v if v is not None else -1.0, axis, factor, dp, dt)
@@ -953,6 +955,44 @@ def _restart_camera() -> None:
     _configure_camera()
 
 
+def _recover_voltage_for_motion() -> bool:
+    """Temporarily pause the camera to shed load and allow voltage to recover."""
+    if not POWER_MGMT_ENABLED:
+        return False
+    try:
+        lock = _cam_lock  # type: ignore[name-defined]
+        cam = _picam2     # type: ignore[name-defined]
+    except Exception:
+        return False
+    if lock is None:
+        return False
+    global _cam_last_start_ts
+    with lock:
+        if cam is None or _picam2 is None:  # type: ignore[name-defined]
+            return False
+        log.warning("POWER RECOVERY: pausing camera to free headroom for motion command")
+        try:
+            _picam2.stop_recording()  # type: ignore[operator]
+        except Exception:
+            pass
+        try:
+            _picam2.close()  # type: ignore[operator]
+        except Exception:
+            pass
+        globals()["_picam2"] = None
+        _cam_last_start_ts = 0.0
+
+    def _restart_later() -> None:
+        time.sleep(0.75)
+        try:
+            _safe_boot_camera_with_retry()
+        except Exception as e:
+            log.error("Camera restart after power recovery failed: %s", e)
+
+    threading.Thread(target=_restart_later, name="cam-power-recover", daemon=True).start()
+    return True
+
+
 def _ensure_dir(path: str) -> None:
     try:
         os.makedirs(path, exist_ok=True)
@@ -1161,10 +1201,12 @@ _INDEX = f"""<!doctype html>
     const action = resp.power_action || 'bypass';
     const v = typeof resp.voltage_v === 'number' ? resp.voltage_v : null;
     const factor = typeof resp.power_factor === 'number' ? resp.power_factor : null;
+    const recovered = !!resp.power_recovered;
     let text = 'Power: ' + action;
     powerStatus.classList.remove('warn','cutoff');
     if (factor !== null && factor < 0.999) text += ' (' + Math.round(factor*100) + '%)';
     if (v !== null) text += ' @ ' + v.toFixed(2) + 'V';
+    if (recovered) text += ' (camera paused to recover)';
     if (action === 'scale') powerStatus.classList.add('warn');
     if (action === 'inhibit') powerStatus.classList.add('cutoff');
     powerStatus.textContent = text;
@@ -1633,7 +1675,7 @@ def api_move():
     if abs(dp) > 45 or abs(dt) > 45:
         abort(400, description="Single move too large; limit |dp|,|dt| <= 45.")
     hdp, hdt = _view_deltas_to_hw(dp, dt)
-    gdp, gdt, action, v, factor = _motion_gov.apply(hdp, hdt)
+    gdp, gdt, action, v, factor, recovered = _motion_gov.apply(hdp, hdt)
     resp = _servo.move(gdp, gdt)
     if resp is None: return jsonify({"status": "queued"}), 202
     if not resp.ok: abort(503, description=resp.error or "servo error")
@@ -1641,6 +1683,7 @@ def api_move():
     payload["power_action"] = action
     payload["voltage_v"] = v
     payload["power_factor"] = factor
+    payload["power_recovered"] = recovered
     payload["requested_dp"] = dp
     payload["requested_dt"] = dt
     payload["applied_dp"] = gdp
