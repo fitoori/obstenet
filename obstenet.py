@@ -72,6 +72,12 @@ DEFAULT_STEP_DEG: int = 10
 HOST: str = "0.0.0.0"
 PORT: int = 8000
 
+# --- ONVIF / discovery ---
+ONVIF_ENABLE: bool = True
+ONVIF_DEVICE_PATH: str = "/onvif/device_service"
+ONVIF_MEDIA_PATH: str = "/onvif/media_service"
+ONVIF_PTZ_PATH: str = "/onvif/ptz_service"
+
 # --- Resilience: camera watchdog/backoff ---
 CAM_STALL_RESTART_S: float = 2.5        # no frame for this long => restart camera
 CAM_MIN_UPTIME_OK_S: float = 20.0
@@ -112,6 +118,7 @@ import threading
 import time
 import uuid
 import subprocess
+import xml.etree.ElementTree as ET
 from collections import deque, defaultdict
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
@@ -1297,6 +1304,15 @@ def _guess_base_url() -> str:
     return f"http://{host}:{PORT}"
 
 
+def _onvif_uri(path: str, base_url: Optional[str] = None) -> str:
+    base = (base_url or _ha_base_url).rstrip("/") if _ha_base_url else (base_url or _guess_base_url())
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return f"{base}{path}"
+
+
 def _ha_device_info() -> Dict[str, object]:
     return {
         "identifiers": ["obstenet", HA_CAMERA_ID],
@@ -1333,6 +1349,186 @@ def _ha_camera_payload(base_url: str) -> Dict[str, object]:
 
 _ha_base_url: str = _guess_base_url()
 
+
+def _onvif_envelope(body: str) -> str:
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\">"
+        "<SOAP-ENV:Body>" + body + "</SOAP-ENV:Body></SOAP-ENV:Envelope>"
+    )
+
+
+def _onvif_service_map(base_url: Optional[str] = None) -> Dict[str, str]:
+    return {
+        "Device": _onvif_uri(ONVIF_DEVICE_PATH, base_url=base_url),
+        "Media": _onvif_uri(ONVIF_MEDIA_PATH, base_url=base_url),
+        "PTZ": _onvif_uri(ONVIF_PTZ_PATH, base_url=base_url),
+    }
+
+
+def _onvif_capabilities_payload(base_url: Optional[str] = None) -> str:
+    services = _onvif_service_map(base_url=base_url)
+    return _onvif_envelope(
+        f"<tds:GetCapabilitiesResponse xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">"
+        f"<tds:Capabilities>"
+        f"<tds:Device><tt:XAddr xmlns:tt=\"http://www.onvif.org/ver10/schema\">{services['Device']}</tt:XAddr></tds:Device>"
+        f"<tds:Media><tt:XAddr xmlns:tt=\"http://www.onvif.org/ver10/schema\">{services['Media']}</tt:XAddr></tds:Media>"
+        f"<tds:PTZ><tt:XAddr xmlns:tt=\"http://www.onvif.org/ver10/schema\">{services['PTZ']}</tt:XAddr></tds:PTZ>"
+        f"</tds:Capabilities></tds:GetCapabilitiesResponse>"
+    )
+
+
+def _onvif_get_services_payload(base_url: Optional[str] = None) -> str:
+    services = _onvif_service_map(base_url=base_url)
+    body = "".join(
+        f"<tds:Service><tds:Namespace>http://www.onvif.org/ver10/{name.lower()}</tds:Namespace>"
+        f"<tds:XAddr>{uri}</tds:XAddr><tds:Version><tt:Major xmlns:tt=\"http://www.onvif.org/ver10/schema\">2</tt:Major>"
+        f"<tt:Minor xmlns:tt=\"http://www.onvif.org/ver10/schema\">0</tt:Minor></tds:Version></tds:Service>"
+        for name, uri in services.items()
+    )
+    return _onvif_envelope(f"<tds:GetServicesResponse xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">{body}</tds:GetServicesResponse>")
+
+
+def _onvif_profile_payload(base_url: Optional[str] = None) -> str:
+    return _onvif_envelope(
+        "<trt:GetProfilesResponse xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\">"
+        "<trt:Profiles token=\"profile1\" fixed=\"true\" xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
+        "<tt:Name>Obstenet</tt:Name>"
+        "<tt:PTZConfiguration token=\"ptz1\"><tt:Name>PTZ</tt:Name></tt:PTZConfiguration>"
+        "<tt:VideoSourceConfiguration token=\"vsrc1\"><tt:Name>Camera</tt:Name></tt:VideoSourceConfiguration>"
+        "<tt:VideoEncoderConfiguration token=\"venc1\"><tt:Name>MJPEG</tt:Name></tt:VideoEncoderConfiguration>"
+        "</trt:Profiles></trt:GetProfilesResponse>"
+    )
+
+
+def _onvif_stream_payload(base_url: Optional[str] = None) -> str:
+    stream_uri = _onvif_uri("/stream.mjpg", base_url=base_url)
+    return _onvif_envelope(
+        f"<trt:GetStreamUriResponse xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\">"
+        f"<trt:MediaUri><tt:Uri xmlns:tt=\"http://www.onvif.org/ver10/schema\">{stream_uri}</tt:Uri></trt:MediaUri>"
+        f"</trt:GetStreamUriResponse>"
+    )
+
+
+def _onvif_snapshot_payload(base_url: Optional[str] = None) -> str:
+    snap_uri = _onvif_uri("/snapshot.jpg", base_url=base_url)
+    return _onvif_envelope(
+        f"<trt:GetSnapshotUriResponse xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\">"
+        f"<trt:MediaUri><tt:Uri xmlns:tt=\"http://www.onvif.org/ver10/schema\">{snap_uri}</tt:Uri></trt:MediaUri>"
+        f"</trt:GetSnapshotUriResponse>"
+    )
+
+
+def _onvif_date_time_payload() -> str:
+    now = time.gmtime()
+    return _onvif_envelope(
+        "<tds:GetSystemDateAndTimeResponse xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">"
+        "<tds:SystemDateAndTime><tt:UTCDateTime xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
+        f"<tt:Time><tt:Hour>{now.tm_hour}</tt:Hour><tt:Minute>{now.tm_min}</tt:Minute><tt:Second>{now.tm_sec}</tt:Second></tt:Time>"
+        f"<tt:Date><tt:Year>{now.tm_year}</tt:Year><tt:Month>{now.tm_mon}</tt:Month><tt:Day>{now.tm_mday}</tt:Day></tt:Date>"
+        "</tt:UTCDateTime></tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse>"
+    )
+
+
+def _onvif_device_info_payload() -> str:
+    return _onvif_envelope(
+        "<tds:GetDeviceInformationResponse xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">"
+        "<tds:Manufacturer>Obstenet</tds:Manufacturer>"
+        "<tds:Model>PanTilt Camera</tds:Model>"
+        "<tds:FirmwareVersion>1.0</tds:FirmwareVersion>"
+        "<tds:SerialNumber>0001</tds:SerialNumber>"
+        "<tds:HardwareId>obstenet</tds:HardwareId>"
+        "</tds:GetDeviceInformationResponse>"
+    )
+
+
+def _onvif_scopes_payload() -> str:
+    scopes = [
+        "onvif://www.onvif.org/type/ptz",
+        "onvif://www.onvif.org/Profile/Streaming",
+        f"onvif://www.onvif.org/name/{HA_CAMERA_NAME.replace(' ', '_')}",
+    ]
+    body = "".join(f"<tds:Scopes>{s}</tds:Scopes>" for s in scopes)
+    return _onvif_envelope(f"<tds:GetScopesResponse xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">{body}</tds:GetScopesResponse>")
+
+
+def _onvif_probe_response(base_url: Optional[str] = None) -> bytes:
+    xaddr = _onvif_uri(ONVIF_DEVICE_PATH, base_url=base_url)
+    scopes = " ".join([
+        "onvif://www.onvif.org/type/ptz",
+        "onvif://www.onvif.org/Profile/Streaming",
+        "onvif://www.onvif.org/hardware/obstenet",
+    ])
+    payload = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+        " xmlns:dn=\"http://www.onvif.org/ver10/network/wsdl\""
+        " xmlns:wsdd=\"http://schemas.xmlsoap.org/ws/2005/04/discovery\""
+        " xmlns:wsa=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\""
+        " xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">"
+        "<SOAP-ENV:Body><wsdd:ProbeMatches><wsdd:ProbeMatch>"
+        f"<wsa:EndpointReference><wsa:Address>urn:uuid:{HA_CAMERA_ID}</wsa:Address></wsa:EndpointReference>"
+        "<wsdd:Types>dn:NetworkVideoTransmitter tds:Device</wsdd:Types>"
+        f"<wsdd:Scopes>{scopes}</wsdd:Scopes>"
+        f"<wsdd:XAddrs>{xaddr}</wsdd:XAddrs>"
+        "<wsdd:MetadataVersion>1</wsdd:MetadataVersion>"
+        "</wsdd:ProbeMatch></wsdd:ProbeMatches></SOAP-ENV:Body></SOAP-ENV:Envelope>"
+    )
+    return payload.encode("utf-8")
+
+
+def _onvif_handle_ptz(body: str) -> Optional[str]:
+    try:
+        root = ET.fromstring(body)
+        ns = {"tt": "http://www.onvif.org/ver10/schema"}
+        ptz = root.find(".//tt:PanTilt", ns)
+        if ptz is not None:
+            x = float(ptz.attrib.get("x", "0"))
+            y = float(ptz.attrib.get("y", "0"))
+            try:
+                _servo.move(dp=float(x) * DEFAULT_STEP_DEG, dt=float(-y) * DEFAULT_STEP_DEG)
+            except Exception as e:
+                log.warning("PTZ move failed: %s", e)
+        return _onvif_envelope("<tptz:ContinuousMoveResponse xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\" />")
+    except Exception as e:
+        log.warning("Failed to parse PTZ command: %s", e)
+        return None
+
+
+def _onvif_ws_discovery_loop() -> None:
+    """Respond to WS-Discovery probes so Home Assistant finds the device."""
+    if not ONVIF_ENABLE:
+        return
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("", 3702))
+        except OSError:
+            sock.bind(("0.0.0.0", 3702))
+        mreq = struct.pack("=4sl", socket.inet_aton("239.255.255.250"), socket.INADDR_ANY)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        sock.settimeout(1.0)
+    except Exception as e:
+        log.warning("ONVIF discovery listener failed to start: %s", e)
+        return
+
+    log.info("ONVIF WS-Discovery responder listening on udp/3702")
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except Exception as e:
+            log.warning("ONVIF discovery socket error: %s", e)
+            break
+        if b"Probe" not in data:
+            continue
+        try:
+            resp = _onvif_probe_response()
+            sock.sendto(resp, addr)
+        except Exception as e:
+            log.debug("Failed sending WS-Discovery response: %s", e)
 _runtime_started = False
 
 
@@ -1438,6 +1634,42 @@ def _json_errors(err):
 @app.get("/")
 def index():
     return Response(_INDEX, mimetype="text/html; charset=utf-8")
+
+
+@app.route(ONVIF_DEVICE_PATH, methods=["POST"])
+@app.route(ONVIF_MEDIA_PATH, methods=["POST"])
+@app.route(ONVIF_PTZ_PATH, methods=["POST"])
+def onvif_service():
+    if not ONVIF_ENABLE:
+        abort(404)
+    body = request.data.decode("utf-8", errors="ignore")
+    base_url = _ha_base_url or _guess_base_url()
+    resp_xml: Optional[str] = None
+
+    if "GetCapabilities" in body:
+        resp_xml = _onvif_capabilities_payload(base_url=base_url)
+    elif "GetServices" in body:
+        resp_xml = _onvif_get_services_payload(base_url=base_url)
+    elif "GetProfiles" in body:
+        resp_xml = _onvif_profile_payload(base_url=base_url)
+    elif "GetStreamUri" in body:
+        resp_xml = _onvif_stream_payload(base_url=base_url)
+    elif "GetSnapshotUri" in body:
+        resp_xml = _onvif_snapshot_payload(base_url=base_url)
+    elif "GetSystemDateAndTime" in body:
+        resp_xml = _onvif_date_time_payload()
+    elif "GetDeviceInformation" in body:
+        resp_xml = _onvif_device_info_payload()
+    elif "GetScopes" in body:
+        resp_xml = _onvif_scopes_payload()
+    elif "ContinuousMove" in body:
+        resp_xml = _onvif_handle_ptz(body)
+    elif "Stop" in body:
+        resp_xml = _onvif_envelope("<tptz:StopResponse xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\" />")
+
+    if resp_xml is None:
+        abort(400, description="Unsupported ONVIF request")
+    return Response(resp_xml, mimetype="application/soap+xml")
 
 
 @app.get("/.well-known/homeassistant")
@@ -1831,6 +2063,8 @@ def _start_all(force: bool = False) -> None:
     _safe_boot_camera_with_retry()
     th = threading.Thread(target=_camera_watchdog_loop, name="camera-wd", daemon=True)
     th.start()
+    if ONVIF_ENABLE:
+        threading.Thread(target=_onvif_ws_discovery_loop, name="onvif-discovery", daemon=True).start()
     _ha_base_url = _guess_base_url()
     if HA_DISCOVERY_ENABLE:
         try:
