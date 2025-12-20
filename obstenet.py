@@ -91,6 +91,12 @@ MOVE_MIN_INTERVAL_S: float = 0.02
 import os
 from typing import Optional, TYPE_CHECKING
 
+PISUGAR_ENABLED: bool = False
+PISUGAR_BASE_URL: str = os.environ.get("PISUGAR_URL", "http://127.0.0.1:8423")
+PISUGAR_BATTERY_FULL_VOLTS: float = 4.2
+PISUGAR_RAIL_TARGET_VOLTS: float = 5.0
+PISUGAR_BATTERY_THRESHOLD_VOLTS: float = 4.5
+
 # --- Home Assistant integration / discovery ---
 HA_DISCOVERY_ENABLE: bool = os.environ.get("HA_DISCOVERY", "0").lower() in ("1", "true", "yes", "on")
 HA_MQTT_BROKER: Optional[str] = os.environ.get("HA_MQTT_BROKER")
@@ -119,6 +125,7 @@ import time
 import uuid
 import subprocess
 import xml.etree.ElementTree as ET
+import urllib.request
 from collections import deque, defaultdict
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
@@ -214,7 +221,13 @@ def _clamp(x: float, lo: float, hi: float) -> int:
 class VoltageMonitor:
     """Sample supply voltage periodically with Raspberry Pi vcgencmd backend."""
 
-    def __init__(self, enabled: bool = True, sample_hz: float = POWER_SAMPLE_RATE_HZ) -> None:
+    def __init__(
+        self,
+        enabled: bool = True,
+        sample_hz: float = POWER_SAMPLE_RATE_HZ,
+        pisugar_enabled: bool = PISUGAR_ENABLED,
+        pisugar_url: str = PISUGAR_BASE_URL,
+    ) -> None:
         self._enabled = bool(enabled)
         self._sample_hz = max(0.1, float(sample_hz))
         self._last_v: Optional[float] = None
@@ -223,15 +236,17 @@ class VoltageMonitor:
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
         self._th: Optional[threading.Thread] = None
-        self._supported = shutil.which("vcgencmd") is not None
+        self._vcgencmd_supported = shutil.which("vcgencmd") is not None
+        self._pisugar_enabled = bool(pisugar_enabled)
+        self._pisugar_url = pisugar_url.rstrip("/")
         self._logged_unavail = False
 
     def start(self) -> None:
         if not self._enabled:
             return
-        if not self._supported:
+        if not (self._vcgencmd_supported or self._pisugar_enabled):
             if not self._logged_unavail:
-                log.warning("Voltage monitor disabled: vcgencmd not available.")
+                log.warning("Voltage monitor disabled: vcgencmd unavailable and PiSugar disabled.")
                 self._logged_unavail = True
             return
         if self._th and self._th.is_alive():
@@ -260,8 +275,57 @@ class VoltageMonitor:
         uv_now, uv_seen = self._read_throttled()
         return v, uv_now, uv_seen
 
+    def set_pisugar_enabled(self, enabled: bool) -> None:
+        self._pisugar_enabled = bool(enabled)
+
+    def _extract_voltage(self, payload: object) -> Optional[float]:
+        if isinstance(payload, (int, float)):
+            return float(payload)
+        if isinstance(payload, dict):
+            for key in ("voltage", "voltage_v", "battery_voltage", "batteryVoltage"):
+                if key in payload:
+                    try:
+                        return float(payload[key])
+                    except (TypeError, ValueError):
+                        continue
+            for key in ("data", "battery", "result"):
+                if key in payload:
+                    found = self._extract_voltage(payload[key])
+                    if found is not None:
+                        return found
+        if isinstance(payload, list):
+            for item in payload:
+                found = self._extract_voltage(item)
+                if found is not None:
+                    return found
+        return None
+
+    def _read_pisugar_voltage(self) -> Optional[float]:
+        if not self._pisugar_enabled:
+            return None
+        url = f"{self._pisugar_url}/api/v1/getBattery"
+        try:
+            with urllib.request.urlopen(url, timeout=1.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return self._normalize_pisugar_voltage(self._extract_voltage(data))
+        except Exception:
+            return None
+
+    def _normalize_pisugar_voltage(self, v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return None
+        if v < PISUGAR_BATTERY_THRESHOLD_VOLTS:
+            scale = PISUGAR_RAIL_TARGET_VOLTS / max(1e-6, PISUGAR_BATTERY_FULL_VOLTS)
+            return v * scale
+        return v
+
     def _read_voltage(self) -> Optional[float]:
         """Attempt to read the 5V supply; ignore clearly invalid rails (e.g. core)."""
+        v = self._read_pisugar_voltage()
+        if v is not None:
+            return v
+        if not self._vcgencmd_supported:
+            return None
         try:
             # Prefer explicit rail selection if supported; Raspberry Pi's default is SoC core
             # (~1V) which would falsely trigger the motion governor.
@@ -292,6 +356,8 @@ class VoltageMonitor:
             return None
 
     def _read_throttled(self) -> Tuple[bool, bool]:
+        if not self._vcgencmd_supported:
+            return False, False
         try:
             r = subprocess.run(["vcgencmd", "get_throttled"], check=False, capture_output=True, text=True, timeout=1.0)
             if r.returncode != 0:
@@ -319,7 +385,7 @@ class VoltageMonitor:
             return bool(self._uv_seen)
 
     def available(self) -> bool:
-        return self._enabled and self._supported
+        return self._enabled and (self._vcgencmd_supported or self._pisugar_enabled)
 
 
 class MotionGovernor:
@@ -2172,6 +2238,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--host", help="Override bind host (defaults to BIND_MODE logic)")
     parser.add_argument("--port", type=int, help="Override bind port (default: 8000)")
     parser.add_argument("--diagnostic", action="store_true", help="Run dependency diagnostics and exit")
+    parser.add_argument("--pisugar", "-p", action="store_true", help="Enable PiSugar voltage integration")
     args = parser.parse_args(argv)
 
     if args.port is not None:
@@ -2183,6 +2250,11 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     if args.diagnostic:
         sys.exit(_run_diagnostics())
+    if args.pisugar:
+        global PISUGAR_ENABLED
+        PISUGAR_ENABLED = True
+        _voltage_monitor.set_pisugar_enabled(True)
+        log.info("PiSugar integration enabled (base URL: %s).", PISUGAR_BASE_URL)
 
     if (STREAM_ROTATION % 360) not in (0, 90, 180, 270):
         sys.stderr.write("STREAM_ROTATION must be 0/90/180/270\n"); sys.exit(3)
