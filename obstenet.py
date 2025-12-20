@@ -93,6 +93,9 @@ from typing import Optional, TYPE_CHECKING
 
 PISUGAR_ENABLED: bool = False
 PISUGAR_BASE_URL: str = os.environ.get("PISUGAR_URL", "http://127.0.0.1:8423")
+PISUGAR_BATTERY_FULL_VOLTS: float = 4.2
+PISUGAR_RAIL_TARGET_VOLTS: float = 5.0
+PISUGAR_BATTERY_THRESHOLD_VOLTS: float = 4.5
 
 # --- Home Assistant integration / discovery ---
 HA_DISCOVERY_ENABLE: bool = os.environ.get("HA_DISCOVERY", "0").lower() in ("1", "true", "yes", "on")
@@ -304,9 +307,17 @@ class VoltageMonitor:
         try:
             with urllib.request.urlopen(url, timeout=1.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            return self._extract_voltage(data)
+            return self._normalize_pisugar_voltage(self._extract_voltage(data))
         except Exception:
             return None
+
+    def _normalize_pisugar_voltage(self, v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return None
+        if v < PISUGAR_BATTERY_THRESHOLD_VOLTS:
+            scale = PISUGAR_RAIL_TARGET_VOLTS / max(1e-6, PISUGAR_BATTERY_FULL_VOLTS)
+            return v * scale
+        return v
 
     def _read_voltage(self) -> Optional[float]:
         """Attempt to read the 5V supply; ignore clearly invalid rails (e.g. core)."""
