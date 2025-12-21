@@ -57,6 +57,8 @@ POWER_CUTOFF_VOLTS: float = 4.65
 POWER_SCALE_HORIZONTAL: float = 0.8
 POWER_SCALE_VERTICAL_DOWN: float = 0.6
 POWER_SCALE_VERTICAL_UP: float = 0.3
+POWER_SAMPLE_WINDOW_S: float = 20.0
+POWER_TREND_WINDOW_S: float = 60.0
 
 # --- Gestures (macros) ---
 GESTURE_AMPLITUDE_DEG: int = 15
@@ -231,6 +233,16 @@ class VoltageMonitor:
         self._enabled = bool(enabled)
         self._sample_hz = max(0.1, float(sample_hz))
         self._last_v: Optional[float] = None
+        self._battery_percent: Optional[float] = None
+        self._current_a: Optional[float] = None
+        self._power_w: Optional[float] = None
+        self._avg_v: Optional[float] = None
+        self._min_v: Optional[float] = None
+        self._max_v: Optional[float] = None
+        self._trend_v_per_min: Optional[float] = None
+        self._avg_current_a: Optional[float] = None
+        self._avg_power_w: Optional[float] = None
+        self._samples: deque[Tuple[float, Optional[float], Optional[float], Optional[float]]] = deque()
         self._uv_now = False
         self._uv_seen = False
         self._lock = threading.Lock()
@@ -261,44 +273,65 @@ class VoltageMonitor:
     def _run(self) -> None:
         while not self._stop_evt.is_set():
             try:
-                v, uv_now, uv_seen = self._sample_once()
+                v, battery_percent, current_a, power_w, uv_now, uv_seen = self._sample_once()
                 with self._lock:
                     self._last_v = v
+                    self._battery_percent = battery_percent
+                    self._current_a = current_a
+                    self._power_w = power_w
+                    self._update_samples_locked(v, current_a, power_w)
                     self._uv_now = uv_now
                     self._uv_seen = uv_seen
             except Exception:
                 pass
             time.sleep(1.0 / self._sample_hz)
 
-    def _sample_once(self) -> Tuple[Optional[float], bool, bool]:
-        v = self._read_voltage()
+    def _sample_once(self) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], bool, bool]:
+        pisugar = self._read_pisugar_status()
+        v = pisugar.get("voltage")
+        battery_percent = pisugar.get("percent")
+        current_a = pisugar.get("current_a")
+        if v is None:
+            v = self._read_voltage()
+        power_w = v * current_a if v is not None and current_a is not None else None
         uv_now, uv_seen = self._read_throttled()
-        return v, uv_now, uv_seen
+        return v, battery_percent, current_a, power_w, uv_now, uv_seen
 
     def set_pisugar_enabled(self, enabled: bool) -> None:
         self._pisugar_enabled = bool(enabled)
 
-    def _extract_voltage(self, payload: object) -> Optional[float]:
+    def _extract_numeric(self, payload: object, keys: Tuple[str, ...]) -> Tuple[Optional[float], Optional[str]]:
         if isinstance(payload, (int, float)):
-            return float(payload)
+            return float(payload), None
         if isinstance(payload, dict):
-            for key in ("voltage", "voltage_v", "battery_voltage", "batteryVoltage"):
+            for key in keys:
                 if key in payload:
                     try:
-                        return float(payload[key])
+                        return float(payload[key]), key
                     except (TypeError, ValueError):
                         continue
-            for key in ("data", "battery", "result"):
+            for key in ("data", "battery", "result", "info"):
                 if key in payload:
-                    found = self._extract_voltage(payload[key])
+                    found, found_key = self._extract_numeric(payload[key], keys)
                     if found is not None:
-                        return found
+                        return found, found_key
         if isinstance(payload, list):
             for item in payload:
-                found = self._extract_voltage(item)
+                found, found_key = self._extract_numeric(item, keys)
                 if found is not None:
-                    return found
-        return None
+                    return found, found_key
+        return None, None
+
+    def _extract_voltage(self, payload: object) -> Optional[float]:
+        val, _ = self._extract_numeric(payload, ("voltage", "voltage_v", "battery_voltage", "batteryVoltage"))
+        return val
+
+    def _extract_percent(self, payload: object) -> Optional[float]:
+        val, _ = self._extract_numeric(payload, ("percent", "percentage", "battery_percent", "batteryPercentage", "batteryLevel"))
+        return val
+
+    def _extract_current(self, payload: object) -> Tuple[Optional[float], Optional[str]]:
+        return self._extract_numeric(payload, ("current", "current_a", "current_ma", "current_mA", "battery_current"))
 
     def _read_pisugar_voltage(self) -> Optional[float]:
         if not self._pisugar_enabled:
@@ -311,6 +344,32 @@ class VoltageMonitor:
         except Exception:
             return None
 
+    def _read_pisugar_status(self) -> Dict[str, Optional[float]]:
+        if not self._pisugar_enabled:
+            return {"voltage": None, "percent": None, "current_a": None}
+        url = f"{self._pisugar_url}/api/v1/getBattery"
+        try:
+            with urllib.request.urlopen(url, timeout=1.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            voltage = self._normalize_pisugar_voltage(self._extract_voltage(data))
+            percent = self._normalize_pisugar_percent(self._extract_percent(data))
+            current, key = self._extract_current(data)
+            current_a = self._normalize_pisugar_current(current, key)
+            if percent is None:
+                percent = self._read_pisugar_percent_fallback()
+            return {"voltage": voltage, "percent": percent, "current_a": current_a}
+        except Exception:
+            return {"voltage": None, "percent": None, "current_a": None}
+
+    def _read_pisugar_percent_fallback(self) -> Optional[float]:
+        url = f"{self._pisugar_url}/api/v1/getBatteryPercentage"
+        try:
+            with urllib.request.urlopen(url, timeout=1.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return self._normalize_pisugar_percent(self._extract_percent(data))
+        except Exception:
+            return None
+
     def _normalize_pisugar_voltage(self, v: Optional[float]) -> Optional[float]:
         if v is None:
             return None
@@ -319,11 +378,24 @@ class VoltageMonitor:
             return v * scale
         return v
 
+    def _normalize_pisugar_percent(self, percent: Optional[float]) -> Optional[float]:
+        if percent is None:
+            return None
+        if 0.0 <= percent <= 1.0:
+            percent *= 100.0
+        return max(0.0, min(100.0, percent))
+
+    def _normalize_pisugar_current(self, current: Optional[float], key: Optional[str]) -> Optional[float]:
+        if current is None:
+            return None
+        if key and "ma" in key.lower():
+            return current / 1000.0
+        if abs(current) > 10.0:
+            return current / 1000.0
+        return current
+
     def _read_voltage(self) -> Optional[float]:
         """Attempt to read the 5V supply; ignore clearly invalid rails (e.g. core)."""
-        v = self._read_pisugar_voltage()
-        if v is not None:
-            return v
         if not self._vcgencmd_supported:
             return None
         try:
@@ -375,6 +447,51 @@ class VoltageMonitor:
     def voltage(self) -> Optional[float]:
         with self._lock:
             return self._last_v
+
+    def battery_percent(self) -> Optional[float]:
+        with self._lock:
+            return self._battery_percent
+
+    def power_stats(self) -> Dict[str, Optional[float]]:
+        with self._lock:
+            return {
+                "battery_percent": self._battery_percent,
+                "voltage_avg_v": self._avg_v,
+                "voltage_min_v": self._min_v,
+                "voltage_max_v": self._max_v,
+                "voltage_trend_v_per_min": self._trend_v_per_min,
+                "current_a": self._current_a,
+                "current_avg_a": self._avg_current_a,
+                "power_w": self._power_w,
+                "power_avg_w": self._avg_power_w,
+            }
+
+    def _update_samples_locked(self, v: Optional[float], current_a: Optional[float], power_w: Optional[float]) -> None:
+        now = time.monotonic()
+        self._samples.append((now, v, current_a, power_w))
+        cutoff = now - max(POWER_SAMPLE_WINDOW_S, POWER_TREND_WINDOW_S)
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+        volts = [sv for _, sv, _, _ in self._samples if sv is not None]
+        currents = [sc for _, _, sc, _ in self._samples if sc is not None]
+        powers = [sp for _, _, _, sp in self._samples if sp is not None]
+        self._avg_v = sum(volts) / len(volts) if volts else None
+        self._min_v = min(volts) if volts else None
+        self._max_v = max(volts) if volts else None
+        self._avg_current_a = sum(currents) / len(currents) if currents else None
+        self._avg_power_w = sum(powers) / len(powers) if powers else None
+        trend_samples = [(ts, sv) for ts, sv, _, _ in self._samples if sv is not None and ts >= now - POWER_TREND_WINDOW_S]
+        self._trend_v_per_min = self._compute_trend(trend_samples)
+
+    def _compute_trend(self, samples: List[Tuple[float, float]]) -> Optional[float]:
+        if len(samples) < 2:
+            return None
+        t0, v0 = samples[0]
+        t1, v1 = samples[-1]
+        dt = t1 - t0
+        if dt <= 0:
+            return None
+        return (v1 - v0) / (dt / 60.0)
 
     def undervoltage_now(self) -> bool:
         with self._lock:
@@ -1275,11 +1392,15 @@ _INDEX = f"""<!doctype html>
     const v = typeof resp.voltage_v === 'number' ? resp.voltage_v : null;
     const factor = typeof resp.power_factor === 'number' ? resp.power_factor : null;
     const recovered = !!resp.power_recovered;
+    const battery = typeof resp.battery_percent === 'number' ? resp.battery_percent : null;
     let text = 'Power: ' + action;
     powerStatus.classList.remove('warn','cutoff');
     if (factor !== null && factor < 0.999) text += ' (' + Math.round(factor*100) + '%)';
     if (v !== null) text += ' @ ' + v.toFixed(2) + 'V';
     if (recovered) text += ' (camera paused to recover)';
+    if (battery !== null && factor === null && v === null && (action === 'bypass' || action === 'normal')) {
+      text = 'Power: ' + Math.round(battery) + '%';
+    }
     if (action === 'scale') powerStatus.classList.add('warn');
     if (action === 'inhibit') powerStatus.classList.add('cutoff');
     powerStatus.textContent = text;
@@ -1982,6 +2103,8 @@ def api_move():
     payload["voltage_v"] = v
     payload["power_factor"] = factor
     payload["power_recovered"] = recovered
+    payload["battery_percent"] = _voltage_monitor.battery_percent()
+    payload["power_stats"] = _voltage_monitor.power_stats()
     payload["requested_dp"] = dp
     payload["requested_dt"] = dt
     payload["applied_dp"] = gdp
