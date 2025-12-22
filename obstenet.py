@@ -1350,14 +1350,12 @@ _INDEX = f"""<!doctype html>
   <strong>OBSTENET</strong>
   <span class="spacer"></span>
   <div class="toolbar">
-    <label for="step">Step (°)</label>
-    <input id="step" type="number" min="1" max="30" value="{DEFAULT_STEP_DEG}" title="Degrees per nudge">
-    <button id="center" title="Center (home)">Center</button>
-    <button id="snap" title="Open snapshot in new tab">Snapshot</button>
-    <button id="release" title="Power off servos (freewheel)">Release</button>
-    <button id="led" class="hidden" aria-pressed="false" title="Toggle camera LED">LED: Off</button>
+    <input id="step" type="number" min="1" max="30" value="{DEFAULT_STEP_DEG}">
+    <button id="center">Center</button>
+    <button id="snap">Snapshot</button>
+    <button id="release">Release</button>
+    <button id="led" class="hidden" aria-pressed="false">LED: Off</button>
   </div>
-  <div id="power-status" class="status" role="status" aria-live="polite">Power: --</div>
 </header>
 <main>
   <img id="stream" src="/stream.mjpg" alt="camera stream" referrerpolicy="no-referrer" loading="eager" decoding="async">
