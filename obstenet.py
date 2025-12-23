@@ -1316,7 +1316,20 @@ _INDEX = f"""<!doctype html>
   .status.warn {{ color:#ffb347; }}
   .status.cutoff {{ color:#ff6b6b; font-weight:700; }}
   main {{ display:flex; flex-direction:column; align-items:center; gap:.6rem; padding:.6rem; }}
-  img {{ max-width:100%; height:auto; border:1px solid #333; border-radius:6px; }}
+  .stream-wrap {{ position:relative; width:100%; max-width:960px; }}
+  .stream-wrap img {{ display:block; width:100%; height:auto; border:1px solid #333; border-radius:6px; }}
+  .stream-loading {{
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:.5rem;
+    background:rgba(17,17,17,0.78); text-transform:uppercase; letter-spacing:.2em;
+  }}
+  .stream-loading .logo {{
+    font-size:clamp(2.4rem, 7vw, 4.2rem);
+    font-weight:700; color:#f2f2f2;
+  }}
+  .stream-loading .sub {{
+    font-size:clamp(.8rem, 2.6vw, 1.1rem); color:#aaa; letter-spacing:.25em;
+  }}
   .hidden {{ display:none !important; }}
   /* D-pad shows on coarse pointers (touch). Hidden on desktops by default. */
   .dpad {{
@@ -1342,7 +1355,7 @@ _INDEX = f"""<!doctype html>
   /* Embed mode trims padding & borders */
   .compact header {{ padding:.35rem .6rem; }}
   .compact main {{ padding:.3rem; gap:.35rem; }}
-  .compact img {{ border:none; border-radius:0; }}
+  .compact .stream-wrap img {{ border:none; border-radius:0; }}
 </style>
 </head>
 <body>
@@ -1356,9 +1369,17 @@ _INDEX = f"""<!doctype html>
     <button id="release">Release</button>
     <button id="led" class="hidden" aria-pressed="false">LED: Off</button>
   </div>
+  <div id="power-status" class="status" role="status" aria-live="polite">Power: --</div>
+  <div id="connection-status" class="status" role="status" aria-live="polite">Stream: connecting…</div>
 </header>
 <main>
-  <img id="stream" src="/stream.mjpg" alt="camera stream" referrerpolicy="no-referrer" loading="eager" decoding="async">
+  <div class="stream-wrap">
+    <img id="stream" src="/stream.mjpg" alt="camera stream" referrerpolicy="no-referrer" loading="eager" decoding="async">
+    <div id="stream-loading" class="stream-loading" aria-hidden="true">
+      <div class="logo">Obstenet</div>
+      <div class="sub">Loading</div>
+    </div>
+  </div>
   <div class="dpad" aria-label="directional pad">
     <button id="up"    class="btn-up"    aria-label="up">↑</button>
     <button id="left"  class="btn-left"  aria-label="left">←</button>
@@ -1384,6 +1405,44 @@ _INDEX = f"""<!doctype html>
     try {{ return t ? JSON.parse(t) : {{}}; }} catch(_) {{ return {{}}; }}
   }}
   const powerStatus = document.getElementById('power-status');
+  const connectionStatus = document.getElementById('connection-status');
+  const streamImg = document.getElementById('stream');
+  const streamLoading = document.getElementById('stream-loading');
+  let reconnectTimer = null;
+  let reconnectAttempt = 0;
+  let lastConnText = '';
+
+  function setConnectionStatus(text, level) {{
+    if (!connectionStatus || text === lastConnText) return;
+    connectionStatus.classList.remove('warn', 'cutoff');
+    if (level) connectionStatus.classList.add(level);
+    connectionStatus.textContent = text;
+    lastConnText = text;
+  }}
+
+  function showStreamLoading(show) {{
+    if (!streamLoading) return;
+    streamLoading.classList.toggle('hidden', !show);
+    streamLoading.setAttribute('aria-hidden', show ? 'false' : 'true');
+  }}
+
+  function reloadStream() {{
+    if (!streamImg) return;
+    const base = '/stream.mjpg';
+    streamImg.src = base + '?ts=' + Date.now();
+  }}
+
+  function scheduleReconnect() {{
+    if (reconnectTimer) return;
+    reconnectAttempt = Math.min(reconnectAttempt + 1, 8);
+    const delayMs = Math.min(5000, 400 * Math.pow(1.6, reconnectAttempt));
+    setConnectionStatus(`Stream: reconnecting in ${{Math.ceil(delayMs / 1000)}}s…`, 'warn');
+    showStreamLoading(true);
+    reconnectTimer = setTimeout(() => {{
+      reconnectTimer = null;
+      reloadStream();
+    }}, delayMs);
+  }}
   function renderPowerStatus(resp) {{
     if (!powerStatus || !resp || typeof resp !== 'object') return resp;
     const action = resp.power_action || 'bypass';
@@ -1396,13 +1455,29 @@ _INDEX = f"""<!doctype html>
     if (factor !== null && factor < 0.999) text += ' (' + Math.round(factor*100) + '%)';
     if (v !== null) text += ' @ ' + v.toFixed(2) + 'V';
     if (recovered) text += ' (camera paused to recover)';
-    if (battery !== null && factor === null && v === null && (action === 'bypass' || action === 'normal')) {
+    if (battery !== null && factor === null && v === null && (action === 'bypass' || action === 'normal')) {{
       text = 'Power: ' + Math.round(battery) + '%';
-    }
+    }}
     if (action === 'scale') powerStatus.classList.add('warn');
     if (action === 'inhibit') powerStatus.classList.add('cutoff');
     powerStatus.textContent = text;
     return resp;
+  }}
+  if (streamImg) {{
+    showStreamLoading(true);
+    streamImg.addEventListener('load', () => {{
+      reconnectAttempt = 0;
+      if (reconnectTimer) {{
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }}
+      setConnectionStatus('Stream: live');
+      showStreamLoading(false);
+    }});
+    streamImg.addEventListener('error', () => {{
+      scheduleReconnect();
+    }});
+    setConnectionStatus('Stream: connecting…');
   }}
   // LED capability discovery
   (async () => {{
