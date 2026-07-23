@@ -1,0 +1,17 @@
+[Unit]
+Description=obstenet PTZ camera server (MJPEG stream + full-res snapshots + ONVIF)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=s
+WorkingDirectory=/home/s
+ExecStart=/usr/bin/python3 /home/s/obstenet/obstenet.py -p
+Restart=always
+RestartSec=5
+# libcamera can wedge on shutdown; bounded stop window then SIGKILL
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
