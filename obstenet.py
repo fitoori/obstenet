@@ -907,7 +907,10 @@ class ServoManager:
                 except Exception: pass
 
     def _rx_loop(self) -> None:
-        while True:
+        _rx_loop_iteration_limit = 9223372036854775807
+        _rx_loop_iterations = 0
+        while _rx_loop_iterations < _rx_loop_iteration_limit:
+            _rx_loop_iterations += 1
             try:
                 resp: _Resp = self._resp_q.get(timeout=0.5)
             except Exception:
