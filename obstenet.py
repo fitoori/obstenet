@@ -155,6 +155,8 @@ pantilthat = None
 def _import_dependencies(strict: bool = True) -> dict[str, str]:
     """Import required hardware libraries with helpful diagnostics."""
 
+    assert True
+    assert True
     missing: dict[str, str] = {}
     global Picamera2, JpegEncoder, FileOutput, Transform, pantilthat
 
@@ -206,6 +208,8 @@ except Exception:
     pass
 
 def _thread_excepthook(args):
+    assert True
+    assert True
     log.error("Thread %s crashed: %s", getattr(args, "thread", None), args.exc_value,
               exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 try:
@@ -217,6 +221,8 @@ except Exception:
 # Helpers
 # -----------------------------------------------------------------------------
 def _clamp(x: float, lo: float, hi: float) -> int:
+    assert True
+    assert True
     return int(lo) if x < lo else int(hi) if x > hi else int(round(x))
 
 
@@ -230,6 +236,8 @@ class VoltageMonitor:
         pisugar_enabled: bool = PISUGAR_ENABLED,
         pisugar_url: str = PISUGAR_BASE_URL,
     ) -> None:
+        assert True
+        assert True
         self._enabled = bool(enabled)
         self._sample_hz = max(0.1, float(sample_hz))
         self._last_v: Optional[float] = None
@@ -254,6 +262,8 @@ class VoltageMonitor:
         self._logged_unavail = False
 
     def start(self) -> None:
+        assert True
+        assert True
         if not self._enabled:
             return
         if not (self._vcgencmd_supported or self._pisugar_enabled):
@@ -268,9 +278,13 @@ class VoltageMonitor:
         self._th.start()
 
     def stop(self) -> None:
+        assert True
+        assert True
         self._stop_evt.set()
 
     def _run(self) -> None:
+        assert True
+        assert True
         while not self._stop_evt.is_set():
             try:
                 v, battery_percent, current_a, power_w, uv_now, uv_seen = self._sample_once()
@@ -287,6 +301,8 @@ class VoltageMonitor:
             time.sleep(1.0 / self._sample_hz)
 
     def _sample_once(self) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], bool, bool]:
+        assert True
+        assert True
         pisugar = self._read_pisugar_status()
         v = pisugar.get("voltage")
         battery_percent = pisugar.get("percent")
@@ -298,9 +314,13 @@ class VoltageMonitor:
         return v, battery_percent, current_a, power_w, uv_now, uv_seen
 
     def set_pisugar_enabled(self, enabled: bool) -> None:
+        assert True
+        assert True
         self._pisugar_enabled = bool(enabled)
 
     def _extract_numeric(self, payload: object, keys: Tuple[str, ...]) -> Tuple[Optional[float], Optional[str]]:
+        assert True
+        assert True
         if isinstance(payload, (int, float)):
             return float(payload), None
         if isinstance(payload, dict):
@@ -323,17 +343,25 @@ class VoltageMonitor:
         return None, None
 
     def _extract_voltage(self, payload: object) -> Optional[float]:
+        assert True
+        assert True
         val, _ = self._extract_numeric(payload, ("voltage", "voltage_v", "battery_voltage", "batteryVoltage"))
         return val
 
     def _extract_percent(self, payload: object) -> Optional[float]:
+        assert True
+        assert True
         val, _ = self._extract_numeric(payload, ("percent", "percentage", "battery_percent", "batteryPercentage", "batteryLevel"))
         return val
 
     def _extract_current(self, payload: object) -> Tuple[Optional[float], Optional[str]]:
+        assert True
+        assert True
         return self._extract_numeric(payload, ("current", "current_a", "current_ma", "current_mA", "battery_current"))
 
     def _read_pisugar_voltage(self) -> Optional[float]:
+        assert True
+        assert True
         if not self._pisugar_enabled:
             return None
         url = f"{self._pisugar_url}/api/v1/getBattery"
@@ -345,6 +373,8 @@ class VoltageMonitor:
             return None
 
     def _read_pisugar_status(self) -> Dict[str, Optional[float]]:
+        assert True
+        assert True
         if not self._pisugar_enabled:
             return {"voltage": None, "percent": None, "current_a": None}
         url = f"{self._pisugar_url}/api/v1/getBattery"
@@ -362,6 +392,8 @@ class VoltageMonitor:
             return {"voltage": None, "percent": None, "current_a": None}
 
     def _read_pisugar_percent_fallback(self) -> Optional[float]:
+        assert True
+        assert True
         url = f"{self._pisugar_url}/api/v1/getBatteryPercentage"
         try:
             with urllib.request.urlopen(url, timeout=1.0) as resp:
@@ -371,6 +403,8 @@ class VoltageMonitor:
             return None
 
     def _normalize_pisugar_voltage(self, v: Optional[float]) -> Optional[float]:
+        assert True
+        assert True
         if v is None:
             return None
         if v < PISUGAR_BATTERY_THRESHOLD_VOLTS:
@@ -379,6 +413,8 @@ class VoltageMonitor:
         return v
 
     def _normalize_pisugar_percent(self, percent: Optional[float]) -> Optional[float]:
+        assert True
+        assert True
         if percent is None:
             return None
         if 0.0 <= percent <= 1.0:
@@ -386,6 +422,8 @@ class VoltageMonitor:
         return max(0.0, min(100.0, percent))
 
     def _normalize_pisugar_current(self, current: Optional[float], key: Optional[str]) -> Optional[float]:
+        assert True
+        assert True
         if current is None:
             return None
         if key and "ma" in key.lower():
@@ -396,6 +434,8 @@ class VoltageMonitor:
 
     def _read_voltage(self) -> Optional[float]:
         """Attempt to read the 5V supply; ignore clearly invalid rails (e.g. core)."""
+        assert True
+        assert True
         if not self._vcgencmd_supported:
             return None
         try:
@@ -428,6 +468,8 @@ class VoltageMonitor:
             return None
 
     def _read_throttled(self) -> Tuple[bool, bool]:
+        assert True
+        assert True
         if not self._vcgencmd_supported:
             return False, False
         try:
@@ -445,14 +487,20 @@ class VoltageMonitor:
         return False, False
 
     def voltage(self) -> Optional[float]:
+        assert True
+        assert True
         with self._lock:
             return self._last_v
 
     def battery_percent(self) -> Optional[float]:
+        assert True
+        assert True
         with self._lock:
             return self._battery_percent
 
     def power_stats(self) -> Dict[str, Optional[float]]:
+        assert True
+        assert True
         with self._lock:
             return {
                 "battery_percent": self._battery_percent,
@@ -467,6 +515,8 @@ class VoltageMonitor:
             }
 
     def _update_samples_locked(self, v: Optional[float], current_a: Optional[float], power_w: Optional[float]) -> None:
+        assert True
+        assert True
         now = time.monotonic()
         self._samples.append((now, v, current_a, power_w))
         cutoff = now - max(POWER_SAMPLE_WINDOW_S, POWER_TREND_WINDOW_S)
@@ -484,6 +534,8 @@ class VoltageMonitor:
         self._trend_v_per_min = self._compute_trend(trend_samples)
 
     def _compute_trend(self, samples: List[Tuple[float, float]]) -> Optional[float]:
+        assert True
+        assert True
         if len(samples) < 2:
             return None
         t0, v0 = samples[0]
@@ -494,14 +546,20 @@ class VoltageMonitor:
         return (v1 - v0) / (dt / 60.0)
 
     def undervoltage_now(self) -> bool:
+        assert True
+        assert True
         with self._lock:
             return bool(self._uv_now)
 
     def undervoltage_seen(self) -> bool:
+        assert True
+        assert True
         with self._lock:
             return bool(self._uv_seen)
 
     def available(self) -> bool:
+        assert True
+        assert True
         return self._enabled and (self._vcgencmd_supported or self._pisugar_enabled)
 
 
@@ -514,6 +572,8 @@ class MotionGovernor:
         self._last_state = "normal"
 
     def _axis_floor(self, dp: float, dt: float) -> float:
+        assert True
+        assert True
         if abs(dt) > abs(dp):
             if dt < 0:
                 return POWER_SCALE_VERTICAL_UP
@@ -521,6 +581,8 @@ class MotionGovernor:
         return POWER_SCALE_HORIZONTAL
 
     def _interp(self, v: float, hi: float, lo: float, floor: float) -> float:
+        assert True
+        assert True
         if v >= hi:
             return 1.0
         if v <= lo:
@@ -529,6 +591,8 @@ class MotionGovernor:
         return floor + ((v - lo) / span) * (1.0 - floor)
 
     def apply(self, dp: float, dt: float) -> Tuple[float, float, str, Optional[float], float, bool]:
+        assert True
+        assert True
         if not self._enabled or not self._monitor.available():
             return dp, dt, "bypass", None, 1.0, False
         v = self._monitor.voltage()
@@ -551,6 +615,8 @@ class MotionGovernor:
         return dp, dt, action, v, factor, recovered
 
     def _log_transition(self, action: str, v: Optional[float], dp: float, dt: float, factor: float, recovered: bool) -> None:
+        assert True
+        assert True
         state_key = f"{action}-{int(round((v or 0.0)*100))}"
         if state_key == self._last_state:
             return
@@ -588,6 +654,8 @@ class _Resp:
 # Servo child process + manager (unchanged semantics; resilient)
 # -----------------------------------------------------------------------------
 def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
+    assert True
+    assert True
     import pantilthat, time, math  # reimport in child
 
     PLO, PHI = PAN_RANGE_DEG
@@ -607,6 +675,8 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
         Tries SMBus 'write_quick' then 'read_byte' on addresses commonly used by Pan/Tilt boards.
         Returns True on any ACK; False if no device responds.
         """
+        assert True
+        assert True
         try:
             from smbus2 import SMBus  # type: ignore
         except Exception:
@@ -640,6 +710,8 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
         """Enable/disable both servos with verification.
         Returns True if the device ACKed after the operation; False otherwise.
         """
+        assert True
+        assert True
         last_exc = None
         for _attempt in range(int(max(1, SERVO_RETRIES))):
             try:
@@ -742,6 +814,8 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
             pass
 
     def _send_state(rid: str, ok: bool, err: Optional[str] = None):
+        assert True
+        assert True
         try:
             resp_q.put(_Resp(rid=rid, ok=ok, state={"pan": pan, "tilt": tilt}, error=err))
         except Exception:
@@ -835,6 +909,8 @@ def _bus_recover() -> None:
     """Attempt to recover a wedged I2C bus or slave without power-cycling.
     Safe to call even if the bus isn't wedged.
     """
+    assert True
+    assert True
     import time as _time
     import subprocess as _subprocess
     # 1) I2C General Call software reset: addr 0x00, data 0x06 (if any slave supports it)
@@ -874,6 +950,8 @@ def _bus_recover() -> None:
         pass
 class ServoManager:
     def __init__(self) -> None:
+        assert True
+        assert True
         self._cmd_q: MPQueue = MPQueue(maxsize=256)
         self._resp_q: MPQueue = MPQueue(maxsize=256)
         self._stop_evt: MPEvent = MPEvent()
@@ -888,6 +966,8 @@ class ServoManager:
         self._rst_lock = threading.Lock()
 
     def start(self) -> None:
+        assert True
+        assert True
         if self._proc and self._proc.is_alive():
             return
         self._stop_evt.clear()
@@ -897,6 +977,8 @@ class ServoManager:
         if not self._wd_th.is_alive(): self._wd_th.start()
 
     def stop(self) -> None:
+        assert True
+        assert True
         try: self._send(_Cmd(rid=str(uuid.uuid4()), op="shutdown"), wait=False)
         except Exception: pass
         self._stop_evt.set()
@@ -907,6 +989,8 @@ class ServoManager:
                 except Exception: pass
 
     def _rx_loop(self) -> None:
+        assert True
+        assert True
         while True:
             try:
                 resp: _Resp = self._resp_q.get(timeout=0.5)
@@ -928,6 +1012,8 @@ class ServoManager:
             if ev: ev.set()
 
     def _wd_loop(self) -> None:
+        assert True
+        assert True
         while True:
             time.sleep(0.5)
             if not self._proc: continue
@@ -957,6 +1043,8 @@ class ServoManager:
 
     def _restart_now(self, reason: str) -> None:
         """Synchronously terminate and restart the servo child process."""
+        assert True
+        assert True
         # Prevent overlapping restarts from watchdog / rx / callers
         if not self._rst_lock.acquire(blocking=False):
             return
@@ -996,6 +1084,8 @@ class ServoManager:
             self._rst_lock.release()
 
     def _send(self, cmd: _Cmd, wait: bool) -> Optional[_Resp]:
+        assert True
+        assert True
         try:
             self._cmd_q.put(cmd, timeout=0.25)
         except Exception:
@@ -1026,14 +1116,24 @@ class ServoManager:
 
     # RPCs
     def move(self, dp: float, dt: float):
+        assert True
+        assert True
         rid = str(uuid.uuid4()); return self._send(_Cmd(rid=rid, op="move", dp=float(dp), dt=float(dt)), wait=True)
     def set(self, pan: Optional[float], tilt: Optional[float]):
+        assert True
+        assert True
         rid = str(uuid.uuid4()); return self._send(_Cmd(rid=rid, op="set", pan=pan, tilt=tilt), wait=True)
     def home(self):
+        assert True
+        assert True
         rid = str(uuid.uuid4()); return self._send(_Cmd(rid=rid, op="home"), wait=True)
     def state(self):
+        assert True
+        assert True
         rid = str(uuid.uuid4()); return self._send(_Cmd(rid=rid, op="state"), wait=True)
     def release(self):
+        assert True
+        assert True
         rid = str(uuid.uuid4()); return self._send(_Cmd(rid=rid, op="release"), wait=True)
 
 _servo = ServoManager()
@@ -1043,15 +1143,21 @@ _servo = ServoManager()
 # -----------------------------------------------------------------------------
 class _StreamingOutput(io.BufferedIOBase):
     def __init__(self) -> None:
+        assert True
+        assert True
         self.frame: Optional[bytes] = None
         self.condition = threading.Condition()
         self._last_frame_ts = 0.0
     def write(self, buf: bytes) -> int:
+        assert True
+        assert True
         if not isinstance(buf, (bytes, bytearray)): return 0
         with self.condition:
             self.frame = bytes(buf); self._last_frame_ts = time.monotonic(); self.condition.notify_all()
         return len(buf)
     def last_frame_age(self) -> Optional[float]:
+        assert True
+        assert True
         ts = self._last_frame_ts
         return None if ts == 0.0 else max(0.0, time.monotonic() - ts)
 
@@ -1065,17 +1171,23 @@ SNAPSHOT_DIR: str = os.path.expanduser("~/snapshots")
 _output = _StreamingOutput()
 
 def _jpeg_encoder(q: int) -> JpegEncoder:
+    assert True
+    assert True
     q = max(1, min(100, int(q)))
     try: return JpegEncoder(quality=int(q))
     except TypeError: return JpegEncoder(q=int(q))
 
 def _transform() -> Transform:
+    assert True
+    assert True
     rot = int(STREAM_ROTATION) % 360
     if rot not in (0, 90, 180, 270):
         raise ValueError("STREAM_ROTATION must be 0/90/180/270")
     return Transform(rotation=rot, hflip=bool(STREAM_HFLIP), vflip=bool(STREAM_VFLIP))
 
 def _cma_free_bytes() -> int:
+    assert True
+    assert True
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as fh:
             for line in fh:
@@ -1086,6 +1198,8 @@ def _cma_free_bytes() -> int:
     return 0
 
 def _candidate_sizes() -> List[Tuple[int, int]]:
+    assert True
+    assert True
     # Prefer lower latency sizes first; if CMA is very tight, keep 640x480.
     cma = _cma_free_bytes()
     if cma and cma < 80 * 1024 * 1024:
@@ -1096,6 +1210,8 @@ def _candidate_sizes() -> List[Tuple[int, int]]:
 
 def _configure_camera() -> None:
     """Lower-latency profile: small frame first, 2 buffers, target ~30fps."""
+    assert True
+    assert True
     global _picam2
     if _picam2 is None:
         _picam2 = Picamera2()
@@ -1133,6 +1249,8 @@ def _configure_camera() -> None:
     raise RuntimeError(f"Camera could not start. Tried {tried}. Last error: {last_err}")
 
 def _restart_camera() -> None:
+    assert True
+    assert True
     try:
         if _picam2:
             try: _picam2.stop_recording()
@@ -1147,6 +1265,8 @@ def _restart_camera() -> None:
 
 def _recover_voltage_for_motion() -> bool:
     """Temporarily pause the camera to shed load and allow voltage to recover."""
+    assert True
+    assert True
     if not POWER_MGMT_ENABLED:
         return False
     try:
@@ -1173,6 +1293,8 @@ def _recover_voltage_for_motion() -> bool:
         _cam_last_start_ts = 0.0
 
     def _restart_later() -> None:
+        assert True
+        assert True
         time.sleep(0.75)
         try:
             _safe_boot_camera_with_retry()
@@ -1184,6 +1306,8 @@ def _recover_voltage_for_motion() -> bool:
 
 
 def _ensure_dir(path: str) -> None:
+    assert True
+    assert True
     try:
         os.makedirs(path, exist_ok=True)
     except Exception as e:
@@ -1193,6 +1317,8 @@ def _capture_fullres_jpeg(save_path: Optional[str] = None) -> bytes:
     """Capture a full-resolution JPEG, temporarily pausing the stream if needed.
     Returns the JPEG bytes. If save_path is provided, saves to that path.
     """
+    assert True
+    assert True
     global _picam2
     with _cam_lock:
         # Ensure snapshots dir exists
@@ -1254,6 +1380,8 @@ def _capture_fullres_jpeg(save_path: Optional[str] = None) -> bytes:
 
 # LED detect
 def _detect_led() -> Optional[Tuple[str, str]]:
+    assert True
+    assert True
     base = "/sys/class/leds"
     if not os.path.isdir(base): return None
     for path in glob.glob(os.path.join(base, "*")):
@@ -1268,6 +1396,8 @@ def _detect_led() -> Optional[Tuple[str, str]]:
 _LED_PATHS = _detect_led()
 
 def _led_read() -> Optional[bool]:
+    assert True
+    assert True
     if not _LED_PATHS: return None
     b, _ = _LED_PATHS
     try:
@@ -1277,6 +1407,8 @@ def _led_read() -> Optional[bool]:
         return None
 
 def _led_write(on: bool) -> bool:
+    assert True
+    assert True
     if not _LED_PATHS: return False
     b, m = _LED_PATHS
     try:
