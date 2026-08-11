@@ -2213,6 +2213,44 @@ def api_servo_release():
     except Exception as e:
         abort(503, description=f"Servo release failed: {e}")
 
+def _gesture_set_or_abort(pan: Optional[float], tilt: Optional[float]) -> None:
+    r = _servo.set(pan, tilt)
+    if not r or not r.ok:
+        abort(503, description=(r.error if r else "servo busy"))
+
+
+def _perform_nod(base_tilt: float, amp: int, cyc: int, step_delay: float) -> None:
+    for _ in range(cyc):
+        for tgt in (
+            _clamp(base_tilt + amp, *TILT_RANGE_DEG),
+            _clamp(base_tilt - amp, *TILT_RANGE_DEG),
+            _clamp(base_tilt + amp, *TILT_RANGE_DEG),
+        ):
+            _gesture_set_or_abort(None, tgt)
+            time.sleep(step_delay)
+    _gesture_set_or_abort(None, base_tilt)
+
+
+def _perform_shake(base_pan: float, amp: int, cyc: int, step_delay: float) -> None:
+    for _ in range(cyc):
+        for tgt in (
+            _clamp(base_pan - amp, *PAN_RANGE_DEG),
+            _clamp(base_pan + amp, *PAN_RANGE_DEG),
+            _clamp(base_pan - amp, *PAN_RANGE_DEG),
+        ):
+            _gesture_set_or_abort(tgt, None)
+            time.sleep(step_delay)
+    _gesture_set_or_abort(base_pan, None)
+
+
+def _perform_gesture(action: str, base_pan: float, base_tilt: float, amp: int, cyc: int, step_delay: float) -> str:
+    if action == "nod":
+        _perform_nod(base_tilt, amp, cyc, step_delay)
+        return "nod"
+    _perform_shake(base_pan, amp, cyc, step_delay)
+    return "shake"
+
+
 @app.post("/api/gesture")
 def api_gesture():
     """Perform 'nod' or 'shake' with bounded amplitude and cycles."""
@@ -2243,32 +2281,8 @@ def api_gesture():
     step_delay = max(0.10, min(0.5, step_delay))
 
     try:
-        if action == "nod":
-            for _ in range(cyc):
-                for tgt in (
-                    _clamp(base_tilt + amp, *TILT_RANGE_DEG),
-                    _clamp(base_tilt - amp, *TILT_RANGE_DEG),
-                    _clamp(base_tilt + amp, *TILT_RANGE_DEG),
-                ):
-                    r = _servo.set(None, tgt)
-                    if not r or not r.ok: abort(503, description=(r.error if r else "servo busy"))
-                    time.sleep(step_delay)
-            r = _servo.set(None, base_tilt)
-            if not r or not r.ok: abort(503, description=(r.error if r else "servo busy"))
-            return jsonify({"ok": True, "action": "nod"})
-        else:
-            for _ in range(cyc):
-                for tgt in (
-                    _clamp(base_pan - amp, *PAN_RANGE_DEG),
-                    _clamp(base_pan + amp, *PAN_RANGE_DEG),
-                    _clamp(base_pan - amp, *PAN_RANGE_DEG),
-                ):
-                    r = _servo.set(tgt, None)
-                    if not r or not r.ok: abort(503, description=(r.error if r else "servo busy"))
-                    time.sleep(step_delay)
-            r = _servo.set(base_pan, None)
-            if not r or not r.ok: abort(503, description=(r.error if r else "servo busy"))
-            return jsonify({"ok": True, "action": "shake"})
+        completed = _perform_gesture(action, base_pan, base_tilt, amp, cyc, step_delay)
+        return jsonify({"ok": True, "action": completed})
     except Exception as e:
         abort(503, description=f"Gesture failed: {e}")
 
