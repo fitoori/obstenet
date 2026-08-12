@@ -113,6 +113,7 @@ HA_CAMERA_ID: str = os.environ.get("HA_CAMERA_ID", "obstenet_cam")
 import argparse
 import atexit
 import glob
+import queue
 import io
 import json
 import logging
@@ -135,6 +136,7 @@ from typing import Dict, Tuple, List
 import faulthandler
 from flask import Flask, Response, abort, jsonify, request, make_response
 from urllib.parse import urlsplit
+from werkzeug.exceptions import HTTPException
 
 from multiprocessing import Process, Queue as MPQueue, Event as MPEvent
 
@@ -165,14 +167,14 @@ def _import_dependencies(strict: bool = True) -> dict[str, str]:
             from picamera2.outputs import FileOutput as _FileOutput  # type: ignore
             from libcamera import Transform as _Transform  # type: ignore
             Picamera2, JpegEncoder, FileOutput, Transform = _Picamera2, _JpegEncoder, _FileOutput, _Transform
-        except Exception as e:  # pragma: no cover - relies on platform packages
+        except ImportError as e:  # pragma: no cover - relies on platform packages
             missing["picamera2/libcamera"] = str(e)
 
     if pantilthat is None:
         try:
             import pantilthat as _pantilthat  # type: ignore
             pantilthat = _pantilthat
-        except Exception as e:  # pragma: no cover - relies on hardware libs
+        except ImportError as e:  # pragma: no cover - relies on hardware libs
             missing["pantilthat"] = str(e)
 
     if missing and strict:
@@ -202,7 +204,7 @@ log = app.logger
 try:
     faulthandler.enable()
     faulthandler.register(signal.SIGUSR1, all_threads=True)
-except Exception:
+except (OSError, RuntimeError, ValueError):
     pass
 
 def _thread_excepthook(args):
@@ -210,7 +212,7 @@ def _thread_excepthook(args):
               exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 try:
     threading.excepthook = _thread_excepthook  # type: ignore[attr-defined]
-except Exception:
+except (AttributeError, TypeError):
     pass
 
 # -----------------------------------------------------------------------------
@@ -282,7 +284,7 @@ class VoltageMonitor:
                     self._update_samples_locked(v, current_a, power_w)
                     self._uv_now = uv_now
                     self._uv_seen = uv_seen
-            except Exception:
+            except (OSError, RuntimeError, TimeoutError, ConnectionError, subprocess.SubprocessError, json.JSONDecodeError, UnicodeError, ValueError, TypeError):
                 pass
             time.sleep(1.0 / self._sample_hz)
 
@@ -341,7 +343,7 @@ class VoltageMonitor:
             with urllib.request.urlopen(url, timeout=1.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             return self._normalize_pisugar_voltage(self._extract_voltage(data))
-        except Exception:
+        except (OSError, TimeoutError, json.JSONDecodeError, UnicodeError, ValueError, TypeError):
             return None
 
     def _read_pisugar_status(self) -> Dict[str, Optional[float]]:
@@ -358,7 +360,7 @@ class VoltageMonitor:
             if percent is None:
                 percent = self._read_pisugar_percent_fallback()
             return {"voltage": voltage, "percent": percent, "current_a": current_a}
-        except Exception:
+        except (OSError, TimeoutError, json.JSONDecodeError, UnicodeError, ValueError, TypeError):
             return {"voltage": None, "percent": None, "current_a": None}
 
     def _read_pisugar_percent_fallback(self) -> Optional[float]:
@@ -367,7 +369,7 @@ class VoltageMonitor:
             with urllib.request.urlopen(url, timeout=1.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             return self._normalize_pisugar_percent(self._extract_percent(data))
-        except Exception:
+        except (OSError, TimeoutError, json.JSONDecodeError, UnicodeError, ValueError, TypeError):
             return None
 
     def _normalize_pisugar_voltage(self, v: Optional[float]) -> Optional[float]:
@@ -411,7 +413,7 @@ class VoltageMonitor:
                     # Reject implausible rails (e.g., core) so we fall back to throttled flags only.
                     if fval >= 3.0:
                         return fval
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             pass
         try:
             r = subprocess.run(["vcgencmd", "measure_volts"], check=False, capture_output=True, text=True, timeout=1.0)
@@ -424,7 +426,7 @@ class VoltageMonitor:
             fval = float(val)
             # Reject implausible rails (e.g., core) so we fall back to throttled flags only.
             return fval if fval >= 3.0 else None
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             return None
 
     def _read_throttled(self) -> Tuple[bool, bool]:
@@ -440,7 +442,7 @@ class VoltageMonitor:
                 uv_now = bool(val & 0x1)
                 uv_seen = bool(val & 0x10000)
                 return uv_now, uv_seen
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             pass
         return False, False
 
@@ -598,7 +600,7 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
     try:
         if hasattr(pantilthat, "frequency"):
             pantilthat.frequency(50)
-    except Exception:
+    except (OSError, RuntimeError, AttributeError, TypeError, ValueError):
         pass
 
 
@@ -609,7 +611,7 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
         """
         try:
             from smbus2 import SMBus  # type: ignore
-        except Exception:
+        except ImportError:
             # If smbus2 isn't present, we can't actively test; assume OK to avoid false faults.
             return True
         addrs = (0x15, 0x40)  # Pimoroni PIC16F1503 (0x15) or PCA9685 (0x40)
@@ -621,17 +623,17 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
                         try:
                             _bus.write_quick(_addr)
                             return True
-                        except Exception:
+                        except (OSError, RuntimeError, AttributeError, TypeError, ValueError):
                             # Fallback to a harmless single byte read (many devices NACK if unsupported)
                             try:
                                 _ = _bus.read_byte(_addr)
                                 return True
-                            except Exception:
+                            except (OSError, RuntimeError, AttributeError, TypeError, ValueError):
                                 pass
-                    except Exception:
+                    except (OSError, RuntimeError, AttributeError, TypeError, ValueError):
                         # Try next address
                         pass
-        except Exception:
+        except (OSError, RuntimeError, AttributeError, TypeError, ValueError):
             # Opening bus failed
             return False
         return False
@@ -650,18 +652,18 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
                     time.sleep(0.02)
                 if _i2c_ping():
                     return True
-            except Exception as e:
+            except (OSError, RuntimeError, AttributeError, TypeError, ValueError) as e:
                 last_exc = e
             # brief backoff
             try:
                 time.sleep(0.05)
-            except Exception:
+            except (OSError, RuntimeError, ValueError):
                 pass
         # If we reach here, enabling/disabling did not verify
         try:
             # Report heartbeat fault so the watchdog can kick in if needed
             resp_q.put(_Resp(rid="hb", ok=False, kind="heartbeat", error=f"servo_enable_failed: {last_exc}"))
-        except Exception:
+        except (OSError, EOFError, RuntimeError, ValueError, queue.Full, BrokenPipeError):
             pass
         return False
 
@@ -674,7 +676,7 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
                 last_exc = e
                 time.sleep(0.015 * attempt)
                 _safe_enable(False); time.sleep(0.010); _safe_enable(True)
-            except Exception as e:
+            except (RuntimeError, AttributeError, TypeError, ValueError) as e:
                 last_exc = e; break
         raise RuntimeError(f"Servo write failed ({val}): {last_exc}")
 
@@ -738,13 +740,13 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
         servo_enabled = True
         try:
             last_apply = _write_axes(pan, tilt)
-        except Exception:
+        except (OSError, RuntimeError, AttributeError, TypeError, ValueError):
             pass
 
     def _send_state(rid: str, ok: bool, err: Optional[str] = None):
         try:
             resp_q.put(_Resp(rid=rid, ok=ok, state={"pan": pan, "tilt": tilt}, error=err))
-        except Exception:
+        except (OSError, EOFError, RuntimeError, ValueError, queue.Full, BrokenPipeError):
             pass
 
     _ka_fail = 0
@@ -753,7 +755,7 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
         if now - last_hb >= HEARTBEAT_PERIOD_S:
             last_hb = now
             try: resp_q.put(_Resp(rid="hb", ok=True, kind="heartbeat"))
-            except Exception: pass
+            except (OSError, EOFError, RuntimeError, ValueError, queue.Full, BrokenPipeError): pass
 
         if servo_enabled and (now - last_apply) >= KEEPALIVE_PERIOD_S:
             try:
@@ -762,16 +764,16 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
                 if not _i2c_ping():
                     raise RuntimeError("i2c ping failed after keepalive write")
                 _ka_fail = 0
-            except Exception as _e:
+            except (OSError, RuntimeError, AttributeError, TypeError, ValueError) as _e:
                 _ka_fail += 1
                 try:
                     log.warning("Keepalive write failed (%d): %s", _ka_fail, _e)
-                except Exception:
+                except (OSError, RuntimeError, TypeError, ValueError):
                     pass
                 if _ka_fail >= 2:
                     # Exit child so watchdog can perform bus recovery and restart cleanly
                     try: resp_q.put(_Resp(rid="hb", ok=False, kind="heartbeat", error="keepalive_failed"))
-                    except Exception: pass
+                    except (OSError, EOFError, RuntimeError, ValueError, queue.Full, BrokenPipeError): pass
                     break
 
         if servo_enabled and SERVO_IDLE_RELEASE_S > 0.0 and (now - last_cmd_ts) >= SERVO_IDLE_RELEASE_S:
@@ -779,7 +781,7 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
 
         try:
             cmd: _Cmd = cmd_q.get(timeout=0.25)
-        except Exception:
+        except (OSError, EOFError, RuntimeError, ValueError, queue.Empty):
             continue
 
         base = cmd
@@ -788,7 +790,7 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
         while True:
             try:
                 nxt: _Cmd = cmd_q.get_nowait()
-            except Exception:
+            except (OSError, EOFError, RuntimeError, ValueError, queue.Empty):
                 break
             if nxt.op in ("move", "set"):
                 abs_p = nxt.pan if nxt.pan is not None else abs_p
@@ -822,7 +824,7 @@ def _servo_child(cmd_q: MPQueue, resp_q: MPQueue, stop_evt: MPEvent) -> None:
                 time.sleep(max(0.0, SERVO_RELEASE_SETTLE_S))
                 _safe_enable(False); servo_enabled = False
             _send_state(base.rid, True)
-        except Exception as e:
+        except (OSError, RuntimeError, AttributeError, TypeError, ValueError) as e:
             _send_state(base.rid, False, str(e))
 
     _safe_enable(False)
@@ -841,13 +843,13 @@ def _bus_recover() -> None:
     try:
         try:
             from smbus2 import SMBus, i2c_msg  # type: ignore
-        except Exception:
+        except ImportError:
             SMBus = None  # type: ignore
         if SMBus is not None:
             with SMBus(1) as _bus:
                 _bus.i2c_rdwr(i2c_msg.write(0x00, [0x06]))
             _time.sleep(0.05)
-    except Exception:
+    except (OSError, RuntimeError, AttributeError, TypeError, ValueError):
         pass
 
     # 2) Pulse SCL to free a slave holding SDA low (9–12 clocks). Use raspi-gpio.
@@ -870,7 +872,7 @@ def _bus_recover() -> None:
         _subprocess.run(["sudo","modprobe","-r","i2c_bcm2835"], check=False, stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL)
         _subprocess.run(["sudo","modprobe","i2c_bcm2835"], check=False, stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL)
         _time.sleep(0.1)
-    except Exception:
+    except (OSError, RuntimeError, ValueError, _subprocess.SubprocessError):
         pass
 class ServoManager:
     def __init__(self) -> None:
@@ -898,19 +900,19 @@ class ServoManager:
 
     def stop(self) -> None:
         try: self._send(_Cmd(rid=str(uuid.uuid4()), op="shutdown"), wait=False)
-        except Exception: pass
+        except (OSError, EOFError, RuntimeError, ValueError, queue.Full, BrokenPipeError, HTTPException): pass
         self._stop_evt.set()
         if self._proc:
             self._proc.join(timeout=1.5)
             if self._proc.is_alive():
                 try: self._proc.terminate()
-                except Exception: pass
+                except (OSError, RuntimeError, ValueError): pass
 
     def _rx_loop(self) -> None:
         while True:
             try:
                 resp: _Resp = self._resp_q.get(timeout=0.5)
-            except Exception:
+            except (OSError, EOFError, RuntimeError, ValueError, queue.Empty):
                 continue
             if resp.kind == "heartbeat":
                 if resp.ok:
@@ -919,7 +921,7 @@ class ServoManager:
                     # Heartbeat reported a fault; restart child
                     try:
                         self._restart_now("heartbeat_fault")
-                    except Exception:
+                    except (OSError, RuntimeError, ValueError):
                         pass
                 continue
             with self._lock:
@@ -938,12 +940,12 @@ class ServoManager:
                 try:
                     if self._proc.is_alive():
                         self._proc.terminate(); self._proc.join(timeout=1.5)
-                except Exception:
+                except (OSError, RuntimeError, ValueError):
                     pass
                 # If it still hasn't exited, perform bus recovery before deciding to restart
                 try:
                     _bus_recover()
-                except Exception:
+                except (OSError, RuntimeError, ValueError):
                     pass
                 if self._proc and self._proc.is_alive():
                     log.error("Old servo process did not exit; skipping restart to avoid bus contention.")
@@ -967,19 +969,19 @@ class ServoManager:
                     try:
                         self._proc.terminate()
                         self._proc.join(timeout=1.5)
-                    except Exception:
+                    except (OSError, RuntimeError, ValueError):
                         pass
                     if self._proc.is_alive():
                         try:
                             self._proc.kill()
                             self._proc.join(timeout=1.0)
-                        except Exception:
+                        except (OSError, RuntimeError, ValueError):
                             pass
-            except Exception:
+            except (OSError, RuntimeError, ValueError):
                 pass
             try:
                 _bus_recover()
-            except Exception:
+            except (OSError, RuntimeError, ValueError):
                 pass
             with self._lock:
                 # Fail all pending waiters
@@ -998,7 +1000,7 @@ class ServoManager:
     def _send(self, cmd: _Cmd, wait: bool) -> Optional[_Resp]:
         try:
             self._cmd_q.put(cmd, timeout=0.25)
-        except Exception:
+        except (OSError, EOFError, RuntimeError, ValueError, queue.Full, BrokenPipeError):
             from flask import abort
             abort(503, description="Servo command queue overloaded.")
         if not wait: return None
@@ -1008,7 +1010,7 @@ class ServoManager:
         if not ev.wait(timeout=wait_s):
             try:
                 self._restart_now("response_timeout")
-            except Exception:
+            except (OSError, RuntimeError, ValueError):
                 pass
             with self._lock:
                 self._pending.pop(cmd.rid, None)
@@ -1020,7 +1022,7 @@ class ServoManager:
         if resp is not None and not getattr(resp, 'ok', True):
             try:
                 self._restart_now("command_error")
-            except Exception:
+            except (OSError, RuntimeError, ValueError):
                 pass
         return resp
 
@@ -1081,7 +1083,7 @@ def _cma_free_bytes() -> int:
             for line in fh:
                 if line.startswith("CmaFree:"):
                     return int(line.split()[1]) * 1024
-    except Exception:
+    except (OSError, UnicodeError, ValueError):
         pass
     return 0
 
@@ -1115,7 +1117,7 @@ def _configure_camera() -> None:
                 frame_us_min = int(1_000_000 / max(1, TARGET_FPS_MAX))
                 frame_us_max = int(1_000_000 / max(1, TARGET_FPS_MIN))
                 _picam2.set_controls({"FrameDurationLimits": (frame_us_min, frame_us_max)})
-            except Exception:
+            except (OSError, RuntimeError, AttributeError, TypeError, ValueError):
                 pass
             enc = _jpeg_encoder(JPEG_QUALITY)
             _picam2.start_recording(enc, FileOutput(_output))
@@ -1127,7 +1129,7 @@ def _configure_camera() -> None:
                 log.warning("DMA OOM at %dx%d: %s; trying next.", w, h, e)
                 time.sleep(0.05); continue
             log.warning("OSError at %dx%d: %s; trying next.", w, h, e)
-        except Exception as e:
+        except (RuntimeError, AttributeError, TypeError, ValueError) as e:
             last_err = e
             log.warning("Configure failed at %dx%d: %s; trying next.", w, h, e)
     raise RuntimeError(f"Camera could not start. Tried {tried}. Last error: {last_err}")
@@ -1136,10 +1138,10 @@ def _restart_camera() -> None:
     try:
         if _picam2:
             try: _picam2.stop_recording()
-            except Exception: pass
+            except (OSError, RuntimeError, AttributeError, TypeError, ValueError): pass
             try: _picam2.close()
-            except Exception: pass
-    except Exception:
+            except (OSError, RuntimeError, AttributeError, TypeError, ValueError): pass
+    except (OSError, RuntimeError, AttributeError, TypeError, ValueError):
         pass
     globals()["_picam2"] = None
     _configure_camera()
