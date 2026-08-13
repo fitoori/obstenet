@@ -2209,21 +2209,24 @@ def api_move():
 
 @app.post("/api/home")
 def api_home():
-    """Home, then sweep tilt to the farthest extreme from current tilt."""
+    """Home both axes to (PAN_HOME_DEG, TILT_HOME_DEG).
+
+    This used to home and then move tilt to "the farthest extreme from current
+    tilt". home() always lands tilt on TILT_HOME_DEG first, so that second move
+    was a constant, not a sweep: it parked tilt on TILT_RANGE_DEG[0] every time,
+    resting the servo against a mechanical stop and contradicting
+    TILT_HOME_DEG's own "avoids starting near a mechanical stop". Every caller
+    (Home Assistant rest_command/scripts, the web UI Center and home buttons,
+    the 'c' hotkey) means "recentre". A deliberate extreme-tilt move is still
+    available via POST /api/set. See tests/test_api_home.py.
+    """
     try:
-        r1 = _servo.home()
-        if r1 is None: return jsonify({"status": "queued"}), 202
-        if not r1.ok:  abort(503, description=r1.error or "servo error during home")
-        state = r1.state or {}
-        cur_tilt = float(state.get("tilt", TILT_HOME_DEG))
-        tlo, thi = float(TILT_RANGE_DEG[0]), float(TILT_RANGE_DEG[1])
-        target_tilt = thi if abs(cur_tilt - tlo) < abs(thi - cur_tilt) else tlo
-        r2 = _servo.set(None, target_tilt)
-        if r2 is None: return jsonify({"status": "queued"}), 202
-        if not r2.ok:  abort(503, description=r2.error or "servo error during tilt sweep")
-        return jsonify(r2.state or {})
+        r = _servo.home()
+        if r is None: return jsonify({"status": "queued"}), 202
+        if not r.ok:  abort(503, description=r.error or "servo error during home")
+        return jsonify(r.state or {})
     except Exception as e:
-        abort(503, description=f"Servo home/sweep failed: {e}")
+        abort(503, description=f"Servo home failed: {e}")
 
 @app.post("/api/servo/release")
 def api_servo_release():
