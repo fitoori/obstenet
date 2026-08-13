@@ -1069,6 +1069,12 @@ _picam2: Optional[Picamera2] = None
 # Synchronization for camera reconfiguration and snapshots
 _cam_lock = threading.RLock()
 _snap_lock = threading.Lock()
+# Bounded wait for the snapshot lock. A capture wedged inside libcamera used to
+# hold the plain `with _snap_lock:` forever, and every later /snapshot.jpg
+# request queued behind it eternally (observed 2026-07-22: one poisoned capture
+# made the endpoint hang for hours). A bounded acquire converts that into a
+# clean 503 + Retry-After while the operator still sees the root wedge logged.
+SNAPSHOT_LOCK_TIMEOUT_S = float(os.environ.get("OBSTENET_SNAP_LOCK_TIMEOUT", "20"))
 SNAPSHOT_DIR: str = os.path.expanduser("~/snapshots")
 
 _output = _StreamingOutput()
@@ -2034,11 +2040,19 @@ def snapshot():
     # Validate and expand home dir to avoid surprises
     dest_dir = os.path.expanduser(dest_dir)
     save_path = os.path.join(dest_dir, fname)
-    with _snap_lock:
-        try:
-            data = _capture_fullres_jpeg(save_path)
-        except Exception as e:
-            abort(503, description=f"Snapshot failed: {e}")
+    if not _snap_lock.acquire(timeout=SNAPSHOT_LOCK_TIMEOUT_S):
+        log.error("snapshot: lock held > %.0fs — a capture is wedged; returning 503 "
+                  "instead of queueing forever", SNAPSHOT_LOCK_TIMEOUT_S)
+        resp = Response("snapshot busy: a capture is already in progress\n",
+                        status=503, mimetype="text/plain")
+        resp.headers["Retry-After"] = "5"
+        return resp
+    try:
+        data = _capture_fullres_jpeg(save_path)
+    except Exception as e:
+        abort(503, description=f"Snapshot failed: {e}")
+    finally:
+        _snap_lock.release()
     resp = Response(data, mimetype="image/jpeg")
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
