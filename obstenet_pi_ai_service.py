@@ -1,3 +1,4 @@
+# obstenet_pi_ai_service.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -64,7 +65,9 @@ try:
     from picamera2.encoders import JpegEncoder
     from picamera2.outputs import FileOutput
     from libcamera import Transform
-except Exception as e:
+# narrow: optional third-party imports raise ImportError; OSError covers
+# broken shared-library loads (e.g. missing libcamera .so).
+except (ImportError, OSError) as e:
     _LOG.error("Picamera2/libcamera import failed: %s", e)
     raise SystemExit(2) from e
 
@@ -72,19 +75,23 @@ try:
     # IMX500 helper must be imported *before* Picamera2() is instantiated.
     from picamera2.devices.imx500 import IMX500
     _IMX500_AVAILABLE = True
-except Exception:
+# narrow: optional import may be absent (ImportError) or fail to load its
+# native backend (OSError); either means IMX500 support is unavailable.
+except (ImportError, OSError):
     _IMX500_AVAILABLE = False
 
 try:
     import numpy as np
-except Exception as e:
+# narrow: numpy is a hard dependency; only its import can fail here.
+except ImportError as e:
     _LOG.error("numpy import failed: %s", e)
     raise SystemExit(2) from e
 
 try:
     import cv2
     _CV2_AVAILABLE = True
-except Exception:
+# narrow: OpenCV is optional; import failure or broken native lib disables it.
+except (ImportError, OSError):
     _CV2_AVAILABLE = False
 
 # ---------------------------
@@ -221,7 +228,10 @@ class PiAICameraService:
         try:
             self._boot_camera()
             self._capture_loop()
-        except Exception as e:
+        # narrow: boot/capture surface config, I/O and runtime faults; catch the
+        # concrete families (value/type errors, OS/DMA errors, RuntimeError for
+        # camera-configure failures) instead of bare Exception.
+        except (ValueError, TypeError, OSError, RuntimeError) as e:
             self._last_error = f"{type(e).__name__}: {e}"
             _LOG.exception("Fatal error in capture loop: %s", e)
         finally:
@@ -248,7 +258,10 @@ class PiAICameraService:
             except FileNotFoundError as e:
                 _LOG.error("Model file not found: %s", e)
                 self._imx500 = None
-            except Exception as e:
+            # narrow: IMX500 init failures beyond missing-file are OS/IO errors,
+            # malformed model data (ValueError) or unmet API contracts
+            # (RuntimeError); AI is disabled gracefully in all cases.
+            except (OSError, ValueError, RuntimeError) as e:
                 _LOG.error("IMX500 init failed (%s). Continuing without AI.", e)
                 self._imx500 = None
 
@@ -279,7 +292,10 @@ class PiAICameraService:
                     time.sleep(0.05)
                     continue
                 _LOG.warning("OSError configuring %dx%d: %s; trying next size", w, h, e)
-            except Exception as e:
+            # narrow: non-OSError configure faults are invalid config values
+            # (ValueError), wrong argument types (TypeError) or API-state
+            # violations (RuntimeError); all trigger the next-size fallback.
+            except (ValueError, TypeError, RuntimeError) as e:
                 last_err = e
                 _LOG.warning("Configure failed at %dx%d: %s; trying next size", w, h, e)
         else:
@@ -297,7 +313,10 @@ class PiAICameraService:
                 if dets is not None:
                     with self._dets_lock:
                         self._last_dets = dets[: self.max_detections]
-            except Exception as e:
+            # narrow: per-frame parsing raises value/type errors on malformed
+            # tensors, KeyError on missing metadata, IndexError on short output
+            # lists, or AttributeError from a None handle; non-fatal, keep running.
+            except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e:
                 # Non-fatal; keep running
                 self._last_error = f"parse_detections: {type(e).__name__}: {e}"
 
@@ -345,11 +364,15 @@ class PiAICameraService:
             if self._picam:
                 try:
                     self._picam.stop_recording()
-                except Exception:
+                # narrow: stopping an already-stopped/unconfigured camera raises
+                # RuntimeError; a broken device surfaces OSError. Best-effort cleanup.
+                except (RuntimeError, OSError):
                     pass
                 try:
                     self._picam.close()
-                except Exception:
+                # narrow: closing an already-closed handle raises RuntimeError;
+                # underlying device errors surface OSError. Best-effort cleanup.
+                except (RuntimeError, OSError):
                     pass
         finally:
             self._picam = None
@@ -371,11 +394,15 @@ class PiAICameraService:
         # Default path: SSD/YOLO style boxes,scores,classes in first 3 tensors.
         try:
             boxes, scores, classes = np_outputs[0][0], np_outputs[1][0], np_outputs[2][0]
-        except Exception as e:
+        # narrow: indexing a differently-packed output tuple raises IndexError,
+        # KeyError, or TypeError; fall back to the alternate parser.
+        except (IndexError, KeyError, TypeError) as e:
             # Some models (nanodet) pack differently; try fallbacks
             try:
                 boxes, scores, classes = self._fallback_parse(np_outputs)
-            except Exception as e2:
+            # narrow: the fallback parser re-raises structural errors (index/key/
+            # type) or value errors on incompatible tensors; wrap into ValueError.
+            except (IndexError, KeyError, TypeError, ValueError) as e2:
                 raise ValueError(f"Unexpected outputs format: {e} / {e2}")
 
         # Normalize/reshape boxes if necessary; expected [N,4] in xywh or xyxy in *input* tensor space
@@ -414,7 +441,10 @@ class PiAICameraService:
                 x1i, y1i, x2i, y2i = imx.convert_inference_coords([x1, y1, x2, y2], metadata, picam)
                 x, y = int(max(0, min(x1i, x2i))), int(max(0, min(y1i, y2i)))
                 w, h = int(abs(x2i - x1i)), int(abs(y2i - y1i))
-            except Exception:
+            # narrow: coord-conversion faults are value/type errors, IndexError
+            # on short boxes, or AttributeError if the helper API is missing;
+            # fall back to direct ISP clamping in all these cases.
+            except (ValueError, TypeError, IndexError, AttributeError):
                 # Fallback: assume xywh already in ISP units or normalized to ISP
                 if normed:
                     x = int(round(box[0] * isp_w)); y = int(round(box[1] * isp_h))
@@ -446,7 +476,10 @@ class PiAICameraService:
             inp_w, inp_h = self._imx500.get_input_size() if self._imx500 else (1, 1)
             boxes = scale_boxes(boxes, 1, 1, inp_h, inp_w, False, False)
             return boxes, scores, classes
-        except Exception as e:
+        # narrow: missing postprocess module (ImportError) or structurally
+        # incompatible outputs (index/key/type/value errors) propagate to the
+        # caller, which converts them into a single ValueError.
+        except (ImportError, IndexError, KeyError, TypeError, ValueError):
             raise
 
     def _get_isp_size(self, picam: Picamera2) -> Tuple[int, int]:
@@ -455,7 +488,10 @@ class PiAICameraService:
             if size is None:
                 return tuple(picam.camera_configuration()['main']['size'])
             return int(size[0]), int(size[1])
-        except Exception:
+        # narrow: querying ISP size can raise AttributeError (no helper),
+        # KeyError/TypeError on config lookup, or ValueError on bad values;
+        # fall back to the configured main-stream size.
+        except (AttributeError, KeyError, TypeError, ValueError):
             return tuple(picam.camera_configuration()['main']['size'])
 
     def _read_labels_from_config(self, imx: IMX500) -> Optional[List[str]]:
@@ -464,7 +500,9 @@ class PiAICameraService:
             labels = cfg.get("labels")
             if isinstance(labels, list) and all(isinstance(x, str) for x in labels):
                 return labels
-        except Exception:
+        # narrow: config may be absent/None (AttributeError) or not a mapping
+        # (TypeError), and a malformed structure yields KeyError; treat as "no labels".
+        except (AttributeError, TypeError, KeyError):
             pass
         return None
 
