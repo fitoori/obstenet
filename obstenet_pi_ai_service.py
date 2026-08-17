@@ -1,3 +1,4 @@
+# obstenet_pi_ai_service.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -492,6 +493,12 @@ class PiAICameraService:
 from flask import Flask, jsonify, Response, request, abort
 
 def create_app(service: PiAICameraService) -> Flask:
+    # Contract: caller must supply a real service exposing the read APIs the
+    # routes below call; a missing/mistyped service would fail only at request
+    # time deep inside a handler, so validate the precondition here.
+    assert service is not None, "create_app: service must not be None"
+    assert hasattr(service, "health") and hasattr(service, "latest_detections"), \
+        "create_app: service must expose health() and latest_detections()"
     app = Flask(__name__)
 
     @app.route("/healthz")
@@ -509,6 +516,13 @@ def create_app(service: PiAICameraService) -> Flask:
     @app.route("/detections")
     def detections() -> Response:
         dets = service.latest_detections()
+        # Contract: latest_detections() always returns a list of Detection
+        # snapshots (never None); the comprehension below relies on iterability
+        # and on each element carrying the bbox/conf fields.
+        assert isinstance(dets, list), \
+            "detections: latest_detections() must return a list"
+        assert all(hasattr(d, "conf") and hasattr(d, "cls") for d in dets), \
+            "detections: each detection must carry cls and conf fields"
         return jsonify([{
             "cls": d.cls,
             "label": d.label,
@@ -529,6 +543,11 @@ def create_app(service: PiAICameraService) -> Flask:
 # ---------------------------
 def _parse_cli(argv: List[str]) -> Dict[str, Any]:
     import argparse
+    # Contract: argv is a list of string tokens (already sliced off sys.argv);
+    # argparse.parse_args iterates it and treats each item as a token.
+    assert isinstance(argv, list), "_parse_cli: argv must be a list of strings"
+    assert all(isinstance(tok, str) for tok in argv), \
+        "_parse_cli: every argv token must be a str"
     p = argparse.ArgumentParser(description="OBSTENET Pi AI (IMX500) service")
     p.add_argument("--model", type=str, default=None,
                    help="Path to .rpk model (default: auto-detect installed models).")
@@ -544,10 +563,22 @@ def _parse_cli(argv: List[str]) -> Dict[str, Any]:
     p.add_argument("--log-level", type=str, default="INFO",
                    choices=("DEBUG","INFO","WARNING","ERROR"))
     args = p.parse_args(argv)
-    return vars(args)
+    result = vars(args)
+    # Return-shape contract: a dict carrying every option the caller reads,
+    # with port constrained to the valid TCP range.
+    assert isinstance(result, dict) and "port" in result and "host" in result, \
+        "_parse_cli: parsed result must be a dict containing host and port"
+    assert 0 < int(result["port"]) <= 65535, \
+        "_parse_cli: port must be in 1..65535"
+    return result
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_cli(argv or sys.argv[1:])
+    # Contract: _parse_cli returns a dict with the keys read below; a missing
+    # key would otherwise KeyError deep in service construction.
+    assert isinstance(args, dict), "main: _parse_cli must return a dict"
+    assert "log_level" in args and "port" in args, \
+        "main: parsed args must contain log_level and port"
     _LOG.setLevel(getattr(logging, args["log_level"]))
 
     svc = PiAICameraService(
