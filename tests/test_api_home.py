@@ -1,3 +1,4 @@
+# tests/test_api_home.py
 #!/usr/bin/env python3
 """Hardware-free regression test: POST /api/home must HOME, not sweep to a stop.
 
@@ -97,6 +98,11 @@ def post_home():
     try:
         M.app.config["TESTING"] = True
         resp = M.app.test_client().post("/api/home")
+        # Contract: the fake must actually have been installed and exercised,
+        # and the test client must yield a response object we can inspect.
+        assert M._servo is fake, "post_home: fake servo was not installed on the module"
+        assert resp is not None and hasattr(resp, "status_code"), \
+            "post_home: test client returned no response"
         return fake, resp
     finally:
         M._servo = real
@@ -104,6 +110,11 @@ def post_home():
 # ---- 1. home means home -------------------------------------------------------
 def t_home_is_home():
     fake, resp = post_home()
+    # Contract: post_home yields the recording fake it installed and a response;
+    # if the route never reached the servo, home_calls stays 0.
+    assert isinstance(fake, FakeServo), "t_home_is_home: post_home must return the FakeServo"
+    assert resp is not None and hasattr(resp, "status_code"), \
+        "t_home_is_home: post_home must return a response with a status_code"
     check("1 /api/home returns 200", resp.status_code == 200, resp.status_code)
 
     body = resp.get_json() or {}
